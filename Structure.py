@@ -7,6 +7,7 @@ import uuid
 import asyncio
 import markdown
 from datetime import datetime
+import pdfkit
 from typing import TypedDict, List, Optional, Dict, Any, Annotated
 
 
@@ -19,7 +20,7 @@ from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
 
 from ThesisAgent.BlackBox import CodeGenerationAgent
-from Model import chat_model, parser
+from Model import chat_model, code_model, parser
 
 warnings.filterwarnings('ignore')
 
@@ -28,10 +29,14 @@ warnings.filterwarnings('ignore')
 '''
 
 ### 任务配置 ###
+config = json.load(open('config.json'))
 LLM = chat_model('qwen', temperature=0.7) # 模型
-PATH = 'D:\\AiProgram\\Thesis\\' # 工作目录
-project_name = 'Finance' # 项目名称
+code_LLM = code_model('qwen')
+PATH = config["workbase"] # 工作目录
+project_name = config["project_name"] # 项目名称
 project_dir = os.path.join(PATH, project_name)
+wkhtmltopdf_path = config["wkhtmltopdf_path"]
+
 invalid_chars = r'[\\/:*?"<>|]' # 不计入字数统计的符号
 
 
@@ -134,14 +139,14 @@ def search_node(state: PaperWritingState):
 你是一个论文总结分析专家。
 
 *任务*
-根据传入检索关键词，调用论文搜索工具搜索相关论文，并提取相关信息，解析论文的作者(author)、年份(year)、摘要(abstract)、doi。
+根据传入检索关键词，调用论文搜索工具搜索相关论文，并提取相关信息，解析论文的作者(author)、出版社(public)、年份(year)、摘要(abstract)、doi。
 
 *字数限制*
 摘要: 200-300字。
 
 *输出要求*
 严格遵循JSON的格式。不要有任何其他内容和其他形式的输出，输出的格式如下。
-[{"author": "", "year": "", "abstract": "", "doi":""}]
+[{"author": "", "year": "", "public": "", "abstract": "", "doi":""}]
 '''
     prompts = {
         "messages": [
@@ -161,18 +166,21 @@ def search_node(state: PaperWritingState):
   {
     "author": "Bloom, David E.; Canning, David; Sevilla, Jaypee",
     "year": "2003",
+    "public": "管理科学学报",
     "abstract": "This paper examines the relationship between demographic change and economic growth, focusing on the 'demographic dividend'—the boost to per capita GDP from a rising working-age population share relative to dependents. It uses cross-country panel data to show that favorable age structure significantly accelerates growth via increased labor supply, savings, and human capital investment, and identifies policy conditions for capturing this dividend.",
     "doi": "10.1086/344171"
   },
   {
     "author": "Mason, Andrew; Lee, Ronald",
     "year": "2011",
+    "public": "经管世界",
     "abstract": "The study analyzes how population aging affects GDP and economic sustainability by redefining demographic dependency through the 'support ratio' (working-age population relative to effective consumers). It demonstrates that aging reduces the demographic dividend, lowers potential GDP growth, and increases fiscal pressure on pension and healthcare systems, while highlighting human capital and productivity gains as key mitigators.",
     "doi": "10.1111/j.1749-6632.2011.06050.x"
   },
   {
     "author": "Jones, Charles I.",
     "year": "2019",
+    "public": "北大核心",
     "abstract": "This paper revisits the long-run link between population size, human capital, and GDP growth in a semi-endogenous growth framework. It argues that larger populations drive innovation and knowledge spillovers, boosting total factor productivity and long-run GDP levels, while slower population growth reduces steady-state growth rates, with implications for developed economies facing declining fertility.",
     "doi": "10.1257/jep.33.2.81"
   }
@@ -194,7 +202,7 @@ def report_node(state: PaperWritingState):
 给定'用户要求', "参考文献"，请你按照学术规范生成生成论文的开题报告。包含如下方面：
 1. 确定论文的文章标题和主题
 2. 根据主题和参考文献，生成学术的文献综述。（要求800-1000字）。
-3. 对于研究方法，给出需要提供的数据字段、字段含义、具体的研究方法、模型以及如何用该方法模型研究该数据
+3. 对于研究方法，给出需要提供的数据字段、字段含义以及具体的建模实践（使用的编程语言为Python）
 4. 生成的结构化大纲必须分为"引言", "文献综述", "研究方法", "指标定义"(可以不包含), "研究结果", "总结与展望"，且详细介绍该部分具体的工作
 
 *结构化大纲示例（需要细化每一部分的具体工作）*
@@ -208,9 +216,11 @@ def report_node(state: PaperWritingState):
 
 *要求*
 1. 结构化大纲(detailed_outline)的具体指导要紧扣主题，包含"引言", "文献综述", "研究方法", "指标定义"(可以不包含), "研究结果", "总结与展望"这几个章节。
-2. 文献综述(literature_review)的格式要符合学术规范，只能引用给定的参考文献，且对于引用的部分，要在后面以"(author, year)"的格式标注对应的参考文献。
+2. 文献综述(literature_review)的格式要符合学术规范，只能引用给定的参考文献，且对于引用的部分，**要在后面以"(author, year)"的格式标注对应的参考文献，不能以"author (year)"的格式在前面标注**。
 3. 研究方法(methodology)以JSON格式表示，包含'data','method'两部分。其中'data'对应的值为列表(可以为空，若为空，则表示不需要进行编程)，列表中的每个元素表示数据名称、数据类型、描述，\
 以{"name": "", "type": "", "describe": ""}的JSON格式储存；'method'对应的值为字符串，是对具体的研究方法、模型以及如何用该方法模型研究该数据的描述。
+4. 研究方法(methodology)中的'data'必须包含编程处理时所有涉及到原始字段（由原始字段衍生而来的字段不需要，），包括在'method'中不参与计算，但在数据处理时需要涉及的字段。比如'年份','国家id'等
+5. 研究方法(methodology)中的'method'只能使用'data'中提及的字段名，若需要使用'data'中的字段衍生出的其他字段名（如log, exp变换），需要明确交代该衍生字段与原始字段的计算关系式。'method'中不能涉及到样本数量和时间的要求。
 
 **输出**: 严格遵循JSON的格式，不要有任何其他内容和其他形式的输出，输出的格式如下。
     {"detailed_outline": "", "literature_review": "", "methodology": {"data": [{"name":"", "type":"", "describe":""}], "method": ""}}
@@ -229,11 +239,13 @@ def report_node(state: PaperWritingState):
             raise json.JSONDecodeError(f'plan node "JSON loads error": {e}:')
     else:
         prompt = f'''
-你是一个论文写作专家，现在你需要根据*反馈*修正*论文结构化大纲和文献综述*。
+你是一个论文写作专家，现在你需要根据*反馈*修正论文结构化大纲和文献综述。
 
 *要求*
 1. 结构化大纲(detailed_outline)的具体指导要紧扣主题，包含"引言", "文献综述", "研究方法", "指标定义"(可以不包含), "研究结果", "总结与展望"这几个章节。
-2. 文献综述(literature_review)的格式要符合学术规范(要求800-1000字)，只能引用给定的参考文献，且对于引用的部分，要在后面以"(author, year)"的格式标注对应的参考文献。
+2. 文献综述(literature_review)的格式要符合学术规范
+    - 只能引用给定的参考文献，且对于引用的部分，**要在后面以"(author, year)"的格式标注对应的参考文献，不能以"author (year)"的格式在前面标注**。
+    - 要求800-1000字。
 
 *初稿*
 - 结构化大纲:
@@ -252,7 +264,7 @@ def report_node(state: PaperWritingState):
 '''
         prompts = [
             {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': f'用户的要求为: "{state["user_input"]}"。请严格按照反馈修正结构化大纲和文献综述'},
+            {'role': 'user', 'content': f'用户的要求为: "{state["user_input"]}"。原始文献初稿: "{state["parsed_papers"]}"。请严格按照反馈修正结构化大纲和文献综述'},
         ]
         response = LLM.invoke(prompts).content
         json_response = {"detailed_outline": "", "literature_review": ""}
@@ -286,26 +298,24 @@ def structure_check_node(state:PaperWritingState):
 
     def word_check(text: str):
         length = len(text)
-        if 800 <= length <= 1000:
+        if 800 <= length <= 1100:
             return ''
-        return f'文献综述要求文字为800-1000，实际为{length}字'
+        return f'文献综述要求字数为800-1000，实际为{length}字，请{"增加" if 800 > length else "缩减"}文献综述的字数'
 
     def review_check(text: str):
         errors = []
         words = word_check(text)
         if words:
             errors.append(words)
-        author_year_pairs = {}
-        for x in state['parsed_papers']:
-            author_year_pairs[x['author']] = x['year']
-        pattern = re.compile(r"\((?P<author>.+?)[,，]\s*(?P<year>\d{4})\)", re.UNICODE)
+        pattern = re.compile(r"\((?P<author>.[^,\s.!，。！]?)[,，]\s*(?P<year>\d{4})\)", re.UNICODE)
         for match in pattern.finditer(text):
             author = match.group("author")
             year = match.group("year")
-            if (author in author_year_pairs) and author_year_pairs[author] == year:
-                continue
-            else:
-                errors.append(f'引用了author="{author}",year="{year}"，与参考文献不符。')
+            for meta in state['parsed_papers']:
+                if (author in meta['author']) and meta['year'] == year:
+                    continue
+                else:
+                    errors.append(f'引用了author="{author}",year="{year}"，与参考文献不符')
         return ' | '.join(errors)
 
     outline = outline_check(state['detailed_outline'])
@@ -330,7 +340,7 @@ def code_node(state: PaperWritingState):
     methodology_method = methodology['method']
 
     if methodology_data:
-        agent = CodeGenerationAgent(LLM)
+        agent = CodeGenerationAgent(code_LLM)
         result = agent.run_with_user_interaction(
             uuid.uuid4().hex,
             project_name,
@@ -355,7 +365,7 @@ def write_node(state: PaperWritingState):
             if file.lower().endswith(img_extensions): # 转小写判断，避免大小写问题
                 desc, end = file.rsplit('.', 1)
                 desc = desc.rsplit('\\', 1)[0]
-                image_files.append(f"Img_path: '{file}' ; Img_describe: {desc}")
+                image_files.append(f"Img_path: '{os.path.join(img_path, file)}' ; Img_describe: {desc}")
         image_files = '\n'.join(image_files)
 
         data = "\n".join([
@@ -364,17 +374,18 @@ def write_node(state: PaperWritingState):
             ])
 
         prompt = f'''
-你是一个论文写作专家。
+你是一个论文写作专家，正在完成一篇高质量的博士学位论文。
 
 *任务*
-给定"论文结构化大纲", "文献综述", "方法论", "数据说明", "运行结果", "运行结果图片路径与说明"，请你按照学术规范写一篇论文。
+请依照给定的"论文结构化大纲", 生成一份极其详细、学术严谨的论文。论文字数要求为20000字。
+还给定了"文献综述", "方法论", "数据说明", "运行结果", "运行结果图片路径与说明"，对应了论文写作中需要使用的具体细节。
 
 *要求*
-1. 严格按照"论文结构化大纲"组织行文思路和结构
-2. "文献综述"按照传入的照抄即可
-3. 对于模型方法和数据说明部分，可适当插入公式
-4. 如果给定了图片，可在适当位置插入图片
-5. 论文字数为15000-20000字
+1. **结构要求**: 严格按照"论文结构化大纲"组织行文思路和结构。
+2. **文献综述要求**: 文献综述部分按照给定的"文献综述"的照抄。
+3. **公式要求**: 对于模型方法和数据说明部分，可适当插入公式。
+4. **图片要求**: 如果给定了图片，可在适当位置插入图片。
+5. **字数分配要求**: 请为每个**二级标题**预估建议写作字数，确保**总字数为20000字左右**。
 
 *论文结构化大纲*
 {state["detailed_outline"]}
@@ -398,17 +409,14 @@ def write_node(state: PaperWritingState):
 绝对不允许出现任何自然语言解释、前言、总结、对话、注释、多余说明。
 不允许使用 ```markdown 代码块包裹，不允许加任何多余文字。
 格式规则：
-- 标题仅使用 #、##、###，层级严格对应。
+- 标题仅使用 #、##、###，层级严格对应（编号使用汉字一、二......）。
 - 段落正常书写，不使用粗体以外的强调。
 - 列表使用 - 或 1. 格式。
 - 公式使用 $...$ 或 $$...$$。
 - 图表使用 ![](url) 或 | 表格 | 语法
+- 文章题目层级为#，章节层级为##
 
 **输出**: 你必须严格、唯一、仅按照*Markdown格式规范*输出完整论文。
-请在下面标签中输出Markdown格式论文。
-<markdown>
- # markdown thesis
-</markdown>
 '''
     else:
         prompt = f'''
@@ -428,30 +436,23 @@ def write_node(state: PaperWritingState):
 绝对不允许出现任何自然语言解释、前言、总结、对话、注释、多余说明。
 不允许使用 ```markdown 代码块包裹，不允许加任何多余文字。
 格式规则：
-- 标题仅使用 #、##、###，层级严格对应。
+- 标题仅使用 #、##、###，层级严格对应（编号使用汉字一、二......）。
 - 段落正常书写，不使用粗体以外的强调。
 - 列表使用 - 或 1. 格式。
 - 公式使用 $...$ 或 $$...$$。
 - 图表使用 ![](url) 或 | 表格 | 语法
+- 文章题目层级为#，章节层级为##
 
 **输出**: 你必须严格、唯一、仅按照*Markdown格式规范*输出完整论文。
-请在下面标签中输出修正的Markdown格式论文。
-<markdown>
- # markdown thesis
-</markdown>
 '''
     prompts = [
         {'role': 'system', 'content': prompt},
-        {'role': 'user', 'content': f'按照要求在指定区域生成论文。'},
+        {'role': 'user', 'content': f'按照要求生成论文。'},
     ]
 
     response = LLM.invoke(prompts).content
-    # 提取 markdown论文
-    markdown_pattern = r"<markdown>(.*?)</markdown>"
-    markdown_match = re.search(markdown_pattern, response, re.DOTALL | re.MULTILINE)
-    markdown = markdown_match.group(1).strip() if markdown_match else ""
 
-    return {"draft": markdown}
+    return {"draft": response}
 
 
 def review_node(state: PaperWritingState):
@@ -486,9 +487,7 @@ def review_node(state: PaperWritingState):
 
         # 必须章节
         required_sections = {
-            "#",
-            "## 1", "## 2", "## 3", "## 4", "## 5",
-            "## 引言", "## 文献综述", "## 研究方法", "## 研究结果", "## 总结与展望"
+            "#", "引言", "文献综述", "研究方法", "研究结果", "总结与展望"
         }
         found = set()
 
@@ -514,7 +513,7 @@ def review_node(state: PaperWritingState):
         # 必须章节缺失
         missing = [s for s in required_sections if any(s in sec for sec in found) is False]
         if missing:
-            errors.append(f"缺少章节：{' | '.join(missing[:5])}...")
+            errors.append(f"缺少章节或者章节格式不对：{' | '.join(missing[:5])}...")
 
         # 检查违规前缀废话
         forbidden_prefix = [
@@ -539,7 +538,7 @@ def review_node(state: PaperWritingState):
         review_state = False
 
     return {
-        'len_check': f'论文有效字数为{words}, 要求的字数为15000-20000',
+        'len_check': f'论文有效字数为{words}, 要求的字数为15000-20000，请扩充{18000-words}字',
         'structure_check': ' | '.join(errors),
         'review_state': review_state,
     }
@@ -549,9 +548,21 @@ def format_node(state: PaperWritingState):
     writer = get_stream_writer()
     writer({'node': 'format_node'})
 
-    from weasyprint import HTML
+    #生成文末参考文献#
+    def reference():
+        used = ['## 参考文献']
+        pattern = re.compile(r"\((?P<author>[^,\s.!，。！]+?)[,，]\s*(?P<year>\d{4})\)", re.UNICODE)
+        i = 1
+        for match in pattern.finditer(state["literature_review"]):
+            author = match.group("author")
+            year = match.group("year")
+            for meta in state['parsed_papers']:
+                if author in meta['author'] and year == meta['year']:
+                    used.append(f'[{i}]{meta["author"]}, {meta["public"]}, {meta["year"]}, {meta["doi"]}.')
+                    i += 1
+        return '\n\n'.join(used)
 
-    markdown_content = state["draft"]
+    markdown_content = state["draft"] + reference()
     os.makedirs(project_dir, exist_ok=True)
     # ----------------------
     # 1. 从论文提取标题作为文件名
@@ -569,99 +580,72 @@ def format_node(state: PaperWritingState):
     md_path = os.path.join(project_dir, md_filename)
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(markdown_content)
+        print(f'学术MD保存成功！路径为{md_path}')
 
     # ----------------------
     # 3. 转换为 HTML → 导出 PDF
     # ----------------------
-    html_body = markdown.markdown(
-        markdown_content,
-        extensions=[
-            "tables",  # 支持表格
-            "fenced_code",  # 支持代码块
-            "toc",  # 支持目录
-            "footnotes",
-            "attr_list",
-            "md_in_html",
-            "pymdownx.arithmatex",  # 公式支持
-            "pymdownx.magiclink",
-            "pymdownx.betterem",
-        ],
-        extension_configs={
-            "pymdownx.arithmatex": {
-                "generic": True
-            }
-        }
-    )
-    html_body = re.sub(r"\$\$(.*?)\$\$", r'<span class="math display">\\[\1\\]</span>', html_body, flags=re.DOTALL)
-    html_body = re.sub(r"\$(.*?)\$", r'<span class="math inline">\\(\1\\)</span>', html_body)
+    def markdown_to_academic_pdf(md_file, pdf_file, css_file='academic.css'):
+        """
+        将 Markdown 转换为学术风格的 PDF
 
-    # 美化学术 PDF 样式
-    full_html = f'''
+        参数:
+            md_file: 输入的 .md 文件路径
+            pdf_file: 输出的 .pdf 文件路径
+            css_file: 学术 CSS 样式文件路径
+        """
+        config = pdfkit.configuration(wkhtmltopdf=wkhtmltopdf_path)
+
+        # 1. 读取并转换 Markdown
+        with open(md_file, 'r', encoding='utf-8') as f:
+            md_text = f.read()
+
+        html_body = markdown.markdown(md_text, extensions=[
+            'extra',  # 支持表格、代码块
+            'codehilite',  # 代码高亮
+            'toc'  # 目录
+        ])
+
+        # 2. 构建完整 HTML（含 meta 标签）
+        html_content = f"""
         <!DOCTYPE html>
-        <html lang="zh-CN">
+        <html>
         <head>
-            <meta charset="utf-8">
-            <title>{title}</title>
-            <style>
-                body {{
-                    font-family: "Microsoft YaHei", SimSun, Arial, sans-serif;
-                    font-size: 14.5px;
-                    line-height: 1.7;
-                    margin: 2cm;
-                    color: #222;
-                }}
-                h1, h2, h3, h4, h5 {{
-                    color: #000;
-                    page-break-after: avoid;
-                    page-break-inside: avoid;
-                }}
-                p {{
-                    text-align: justify;
-                    margin: 0.7em 0;
-                }}
-                table {{
-                    border-collapse: collapse;
-                    width: 100%;
-                    margin: 1em 0;
-                    page-break-inside: avoid;
-                }}
-                th, td {{
-                    border: 1px solid #555;
-                    padding: 0.6em;
-                    text-align: center;
-                }}
-                img {{
-                    max-width: 100% !important;
-                    height: auto;
-                    display: block;
-                    margin: 1em auto;
-                    page-break-inside: avoid;
-                }}
-                .math.display {{
-                    text-align: center;
-                    font-size: 1.1em;
-                    margin: 1em 0;
-                }}
-                pre code {{
-                    background: #f3f3f3;
-                    padding: 1em;
-                    display: block;
-                    border-radius: 5px;
-                    page-break-inside: avoid;
-                }}
-            </style>
+            <meta charset="UTF-8">
+            <title>Academic Paper</title>
         </head>
         <body>
-            {html_body}
+            <article>{html_body}</article>
         </body>
         </html>
-        '''
+        """
+
+        # 3. PDF 选项（A4 纸，标准边距）
+        options = {
+            'page-size': 'A4',
+            'margin-top': '2.5cm',
+            'margin-right': '2cm',
+            'margin-bottom': '2cm',
+            'margin-left': '2cm',
+            'encoding': "UTF-8",
+            'quiet': '',  # 静默模式
+            'enable-local-file-access': None,  # 允许加载本地 CSS/图片
+            'dpi': 300,  # 高分辨率
+        }
+
+        # 4. 生成 PDF
+        pdfkit.from_string(
+            html_content,
+            pdf_file,
+            options=options,
+            css=css_file,
+            configuration=config
+        )
+        print(f"学术PDF已生成: {pdf_file}")
 
     # 导出 PDF
     pdf_path = os.path.join(project_dir, f"{title}.pdf")
-    HTML(string=full_html).write_pdf(
-        pdf_path,
-    )
+    markdown_to_academic_pdf(md_path, pdf_path)
 
     writer({'format_step': f"md_path: {md_path} | pdf_path: {pdf_path} | title: {title}"})
 
@@ -714,7 +698,7 @@ if __name__ == '__main__':
         }
     }
     for trunk in graph.stream(
-            {'user_input': '我想写一篇人口对GDP影响的论文。'},
+            {'user_input': '我想写一篇人口对GDP影响的论文。我的方法尽量简单，就使用最简单的线性回归，研究的变量不超过三个。'},
             config):
         print(trunk)
 

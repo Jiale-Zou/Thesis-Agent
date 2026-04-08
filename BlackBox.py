@@ -43,7 +43,10 @@ class CodeAgentState(TypedDict):
     prev_code: str
 
     # 执行结果
-    execution_result: List[Dict[str, str]]  # {stdout, stderr, exit_code}
+    execution_result: Annotated[
+        List[Dict[str, str]],
+        lambda left, right: (left or []) + (right or [])
+    ]  # {stdout, stderr, exit_code}
 
     # 改进建议
     proposal: str
@@ -103,7 +106,7 @@ class CodeGenerationAgent:
                 "complete": END,
             }
         )
-        workflow.add_edge("debug_and_fix", "params_input_node")
+        workflow.add_edge("debug_and_fix", "execute_code")
         # 编译图
         return workflow.compile(checkpointer=self.checkpointer)
 
@@ -140,9 +143,11 @@ class CodeGenerationAgent:
 *要求*
 1. 代码必须包含完整的错误处理
 2. 添加必要的注释
-3. 生成两个文件，第一个为依赖库(requirements)，第二个为完整的代码(main)
+3. 生成两个文件，第一个为依赖库(requirements.txt)，第二个为完整的代码(main.py)
 4. 在*输出*区域内返回Python代码，不要解释。
 5. 需将所有步骤以及结果用print打印出来，方便后续根据print结果判断是否满足用户需求
+6. 尽量只用常见的库实现
+7. 若涉及到数据处理与建模，①需确保**使用的字段只涉及*输入数据说明*中提及的字段名**②不对数据的数量/质量、模型的拟合效果进行检查
 
 *代码格式*
 **1. requirements**: 只包含库的名称。
@@ -211,7 +216,7 @@ class CodeGenerationAgent:
                 f"为运行Python代码，需要传入参数：\n{parameter_str}"
             )
             return {"parameter": response}
-        return
+        return {}
 
 
     def execute_code(self, state: CodeAgentState) -> CodeAgentState:
@@ -252,6 +257,7 @@ class CodeGenerationAgent:
         print(f' >>> code_step: 开始调试和修复代码(Iteration {state.get("iteration_count", 0)})。')
         writer = get_stream_writer()
         writer({'code_step': f'开始调试和修复代码(Iteration {state.get("iteration_count", 0)})。'})
+        print(state['execution_result'][-1]['stdout'])
 
         requirements = state['requirements']
         current_code = state['current_code']
@@ -274,8 +280,8 @@ class CodeGenerationAgent:
                     codeDiff = ''
                 else:
                     codeDiff = f'''
-    新增行数: {codeDiff['added_lines']}
-    删除行数: {codeDiff['removed_lines']}
+    新增行数: {codeDiff['added_lines_count']}
+    删除行数: {codeDiff['removed_lines_count']}
     修改的函数: {' '.join(codeDiff['changed_functions'])}
     '''
             else:
@@ -297,6 +303,9 @@ class CodeGenerationAgent:
 *当前错误*:
 {stderr[-1]}
 
+*当前结果*
+{stdout[-1]}
+
 *历史代码变更*:
 {codeDiff}
 
@@ -315,6 +324,10 @@ class CodeGenerationAgent:
 3. 生成两个文件，第一个为依赖库(requirements)，第二个为完整的代码(main)
 4. 在*输出*区域内返回Python代码，不要解释。
 5. 需将所有步骤以及结果用print打印出来，方便后续根据print结果判断是否满足用户需求
+6. 代码中只能使用*输入数据字段*中的数据字段
+7. 需保证修改后的代码仍然能通过'sys.argv'接收相同的参数
+8. 若代码中涉及到数据处理和建模，需确保**使用的字段只涉及*输入数据说明*中提及的字段名**
+9. 尽量只用常见的库实现
 
 *代码格式*:
 **1. requirements**: 只包含库的名称。
@@ -329,10 +342,6 @@ class CodeGenerationAgent:
 <python>
  # your python
 </python>
-- 返回sys.argv接收的参数列表在下面块中，严格以JSON格式展示。key为参数名称，value为该参数的含义。(若与*当前代码sys.argv接收的参数*一致，则为空)
-<parameter>
-{{"key": "value"}}
-</parameter>
 '''
         else:
             prompt = f'''
@@ -362,6 +371,10 @@ class CodeGenerationAgent:
 2. 添加必要的注释
 3. 在*输出*区域内返回Python代码，不要解释。
 4. 需将所有步骤以及结果用print打印出来，方便后续根据print结果判断是否满足用户需求
+5. 代码中只能使用*输入数据字段*中的数据字段
+6. 需保证修改后的代码仍然能通过'sys.argv'接收相同的参数
+7. 若代码中涉及到数据处理和建模，需确保**使用的字段只涉及*输入数据说明*中提及的字段名**
+9. 尽量只用常见的库实现
 
 *代码格式*:
 必须设置程序主入口'__main__'，并在里面调用函数。函数所需的参数通过外部控制台传入，其中一个必须的参数是文件路径，因此需设置'sys.argv'接收外部传入参数。
@@ -371,10 +384,6 @@ class CodeGenerationAgent:
 <python>
  # your python
 </python>
-- 返回sys.argv接收的参数列表在下面块中，严格以JSON格式展示。key为参数名称，value为该参数的含义。(若与*代码sys.argv接收的参数*一致，则为空)
-<parameter>
-{{"key": "value"}}
-</parameter>
 '''
         prompts = [
             {'role': 'system', 'content': prompt},
@@ -391,20 +400,14 @@ class CodeGenerationAgent:
         python_pattern = r"<python>(.*?)</python>"
         python_match = re.search(python_pattern, response, re.DOTALL | re.MULTILINE)
         code = python_match.group(1).strip() if python_match else ""
-        # 3. 提取输入的参数
-        parameter_pattern = r"<parameter>(.*?)</parameter>"
-        parameter_match = re.search(parameter_pattern, response, re.DOTALL | re.MULTILINE)
-        parameter = parameter_match.group(1).strip() if parameter_match else ""
-        parameter = json.loads(parameter.strip())
 
         return {
             "requirements": requirements if requirements else state["requirements"],
-            "parameter_schema": parameter if parameter else state["parameter_schema"],
-            "if_input": True if parameter else False,
             "current_code": code,
-            "prev_code": prev_code,
-            "iteration_count": state.get("iteration_count", 0) + 1
+            "prev_code": current_code,
+            "iteration_count": state.get("iteration_count", 0) + 1,
         }
+
 
     def evaluate_result(self, state: CodeAgentState) -> CodeAgentState:
         """评估执行结果是否满足需求"""
@@ -517,27 +520,23 @@ class CodeGenerationAgent:
 
 
 
-# if __name__ == '__main__':
-#     from langchain_openai import ChatOpenAI
-#     API_KEY = 'sk-0c2d99c2e46b41f4936baf72a955e032'
-#     # 使用langchain创建访问OpenAI的Model。
-#     model = ChatOpenAI(
-#         model="deepseek-chat",
-#         openai_api_key=API_KEY,
-#         openai_api_base="https://api.deepseek.com/v1",
-#         temperature=0.7
-#     )
-#     agent = CodeGenerationAgent(model)
-#     result = agent.run_with_user_interaction(
-#         '1',
-#         'Code',
-#         [
-#             {"name": "年份", "type": "str", "describe": "(2025-01-01)时间序列数据的时间"},
-#             {"name": "GDP", "type": "float", "describe": "某国家当年的GDP总值"},
-#             {"name": "教育指数", "type": "float", "describe": "一个人为构造的指标，衡量该国的教育水平投入"},
-#         ],
-#         '使用回归分析研究“国家的教育水平”与“该国GDP”的关系。考虑到GDP大多为增长的，过去GDP高的国家，现在的GDP也会很高，因此需要在时间上度GDP做差分，剔除GDP基数的异质性作用。'
-#     )
-#     print(result)
+if __name__ == '__main__':
+    from langchain_openai import ChatOpenAI
+    API_KEY = 'sk-a6647968836d4d9587d9adb77e659727'
+    # 使用langchain创建访问OpenAI的Model。
+    model = ChatOpenAI(
+        model="qwen3-coder-next",
+        openai_api_key=API_KEY,
+        openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        temperature=0.7
+    )
+    agent = CodeGenerationAgent(model)
+    result = agent.run_with_user_interaction(
+        '1',
+        'Finance',
+        [{'name': 'country_id', 'type': 'string', 'describe': '国家ISO三位代码，用于标识观测单位'}, {'name': 'year', 'type': 'integer', 'describe': '年份，范围为1960–2022'}, {'name': 'gdp_growth', 'type': 'float', 'describe': '实际GDP年增长率（%），来源于World Bank WDI'}, {'name': 'gdp_per_capita_growth', 'type': 'float', 'describe': '实际人均GDP年增长率（%），来源于World Bank WDI'}, {'name': 'pop_total', 'type': 'float', 'describe': '总人口（百万），来源于UN World Population Prospects'}, {'name': 'pop_15_64', 'type': 'float', 'describe': '15–64岁人口（百万），来源于UN World Population Prospects'}, {'name': 'pop_65plus', 'type': 'float', 'describe': '65岁及以上人口（百万），来源于UN World Population Prospects'}, {'name': 'pop_0_14', 'type': 'float', 'describe': '0–14岁人口（百万），来源于UN World Population Prospects'}, {'name': 'life_expectancy', 'type': 'float', 'describe': '出生时预期寿命（岁），来源于IHME GBD'}, {'name': 'schooling_mean', 'type': 'float', 'describe': '25岁以上人口平均受教育年限（年），来源于Barro-Lee dataset'}, {'name': 'invest_ratio', 'type': 'float', 'describe': '国内总投资占GDP比重（%），来源于World Bank WDI'}, {'name': 'gov_consumption', 'type': 'float', 'describe': '政府最终消费支出占GDP比重（%），来源于World Bank WDI'}, {'name': 'trade_openness', 'type': 'float', 'describe': '进出口总额占GDP比重（%），来源于World Bank WDI'}, {'name': 'support_ratio', 'type': 'float', 'describe': '支持比，计算式为 pop_15_64 / (pop_0_14 * 0.3 + pop_65plus * 0.8 + pop_15_64 * 1.0)，其中0.3、0.8、1.0为UN Age-Specific Consumption Weights'}, {'name': 'old_dependency_ratio', 'type': 'float', 'describe': '老年抚养比，计算式为 pop_65plus / pop_15_64'}, {'name': 'young_dependency_ratio', 'type': 'float', 'describe': '少儿抚养比，计算式为 pop_0_14 / pop_15_64'}, {'name': 'human_capital_density', 'type': 'float', 'describe': '人力资本密度，计算式为 schooling_mean * (pop_15_64 / pop_total)'}, {'name': 'log_pop_total', 'type': 'float', 'describe': '总人口自然对数，即 log(pop_total)'}],
+        '采用两阶段估计策略：第一阶段使用系统广义矩估计（System GMM）估计动态面板模型 gdp_growth_it = α + β1·gdp_growth_i,t−1 + β2·support_ratio_it + β3·old_dependency_ratio_it + β4·log_pop_total_it + β5·human_capital_density_it + γ·X_it + μ_i + ε_it，其中X_it为invest_ratio、gov_consumption、trade_openness等控制变量，μ_i为国家固定效应，ε_it为扰动项；工具变量集包括所有解释变量的二阶及更高阶滞后项（差分形式）与被解释变量的滞后二阶差分；第二阶段对old_dependency_ratio进行门槛回归，以gdp_growth为因变量，以old_dependency_ratio为门槛变量，识别其对GDP增长影响发生结构性突变的临界值，并检验门槛效应的显著性（Bootstrap法）。所有模型均在Python中通过linearmodels库实现系统GMM估计，通过thresholdmodels库实现门槛回归；数据清洗与特征工程（如support_ratio、human_capital_density、log_pop_total的构造）使用pandas完成，缺失值采用多重插补（fancyimpute）处理。'
+    )
+    print(result)
 
 
