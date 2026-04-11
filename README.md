@@ -32,6 +32,7 @@
 - pandoc：文档格式转换工具
 - MiKTeX：LaTeX发行版（Windows用户）
 - Node.js：JavaScript运行环境，包含 mmdc​ (Mermaid CLI) 用于图表生成
+- mcp服务目录部署
 # 三、运行依赖库
 langchain, langgraph, pypandoc
 # 四、迭代
