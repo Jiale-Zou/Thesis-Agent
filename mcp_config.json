@@ -1,11 +1,32 @@
 {
   "mcpServers": {
     "cnki": {
-      "command": "C:\\Users\\18415\\.local\\bin\\uvx.exe",
+      "command": "D:\\PPrograms\\cnki-mcp\\.venv\\Scripts\\python.exe",
       "args": [
-        "--from",
-        "git+https://github.com/h-lu/cnki-mcp",
-        "cnki-mcp"
+        "D:\\PPrograms\\cnki-mcp\\cnki_mcp_server.py"
+      ],
+      "transport": "stdio"
+    },
+    "article-mcp": {
+      "command": "C:\\Users\\18415\\.local\\bin\\uvx.exe",
+      "args": ["article-mcp"],
+      "transport": "stdio"
+    },
+    "paper_search_server": {
+      "command": "C:\\Users\\18415\\.local\\bin\\uv.exe",
+      "args": [
+        "run",
+        "--directory",
+        "D:\\PPrograms\\mcp_server",
+        "-m",
+        "paper_search_mcp.server"
+      ],
+      "transport": "stdio"
+    },
+    "google-scholar": {
+      "command": "D:\\PPrograms\\google-scholar-MCP-Server\\.venv\\Scripts\\python.exe",
+      "args": [
+        "D:\\PPrograms\\google-scholar-MCP-Server\\google_scholar_server.py"
       ],
       "transport": "stdio"
     }
