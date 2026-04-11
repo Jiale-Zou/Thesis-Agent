@@ -50,7 +50,7 @@ langchain, langgraph, pypandoc
 4. *格式转换*：细化提示词对输出格式的限制，更换Markdown->pdf格式转换工具，使得最后生成的pdf文档更规范。
 ## V3: (ongo)
 1. 前端设计。
-2. 加入Time-Travel机制，以便断点重启或者认为修改state参数。
+2. 加入Time-Travel机制，以便断点重启或者人为修改state参数。
 
 # 五、输出示例
 **V1版本**: 人口规模与结构对GDP总量影响的简约基准估计：一项三变量静态截面回归研究.pdf<br>
