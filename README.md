@@ -26,6 +26,7 @@
 ├── sup_agent.py            # 论文Agent（主Agent）<br>
 ├── mcp_config.json         # MCP服务配置<br>
 └── config.json             # 项目运行参数配置<br>
+
 # 二、前置工具要求
 在运行本项目前，请确保已安装以下工具：
 - uv：Python包管理器和安装工具
@@ -33,6 +34,7 @@
 - MiKTeX：LaTeX发行版（Windows用户）
 - Node.js：JavaScript运行环境，包含 mmdc​ (Mermaid CLI) 用于图表生成
 - mcp服务目录部署
+
 # 三、运行依赖库
 langchain, langgraph, pypandoc
 # 四、迭代
@@ -53,3 +55,7 @@ langchain, langgraph, pypandoc
 # 五、输出示例
 **V1版本**: 人口规模与结构对GDP总量影响的简约基准估计：一项三变量静态截面回归研究.pdf<br>
 **V2版本**: 人口结构双维张力对人均GDP增长的影响：基于劳动供给潜力与老年抚养负担的面板实证分析.pdf
+
+# 六、当前可改进
+论文检索MCP检索效果不好，可更换效果更好的MCP服务，或自定义爬虫脚本。<br>
+可以选取更好的模型，如经过推理后训练的模型，或者GPT系列的模型等
