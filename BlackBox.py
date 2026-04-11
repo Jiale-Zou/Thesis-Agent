@@ -793,7 +793,7 @@ class CodeAgent:
 
 # if __name__ == '__main__':
 #     from langchain_openai import ChatOpenAI
-#     API_KEY = 'sk-a6647968836d4d9587d9adb77e659727'
+#     API_KEY = ''
 #     # 使用langchain创建访问OpenAI的Model。
 #     model = ChatOpenAI(
 #         model="qwen3-coder-next",
