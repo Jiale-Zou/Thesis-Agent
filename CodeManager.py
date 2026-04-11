@@ -88,7 +88,7 @@ Auto-generated project directory for AI Agent code execution.
         self.logger.info(f"Created project directory: {project_dir}")
         return project_dir  # 返回项目路径
 
-    def install_dependencies(self, project_dir: Path, requirements_content: str) -> Dict:
+    def install_dependencies(self, project_dir: Path, step: int, requirements_content: str) -> Dict:
         '''安装requirements.txt中的依赖
         - 安全安装 Python 库
         - 严格限制在沙箱目录内
@@ -98,7 +98,7 @@ Auto-generated project directory for AI Agent code execution.
         if not requirements_content.strip():
             return {"success": True, "message": "No dependencies to install"}
 
-        req_file = project_dir / "requirements.txt"
+        req_file = project_dir / f"requirements{step}.txt"
         req_file.write_text(requirements_content)  # 写入依赖文件
 
         self.logger.info(f"Installing dependencies from {req_file}")
@@ -208,7 +208,7 @@ Auto-generated project directory for AI Agent code execution.
         except ValueError:
             raise ValueError(f"Path {path} is outside project directory {project_dir}")
 
-    def execute_code(self, project_dir: Path, params: List, code: str, filename="main.py") -> Dict:
+    def execute_code(self, project_dir: Path, params: List, code: str, step: int, filename="main.py") -> Dict:
         # 1. 安全检查
         safety_check = self._validate_code_safety(code)
         if not safety_check["safe"]:
@@ -249,7 +249,7 @@ Auto-generated project directory for AI Agent code execution.
             code = textwrap.dedent(code)
             return code
         code = clean_code(code)
-        code_file = project_dir / "src" / filename
+        code_file = project_dir / "src" / f'{step}{filename}'
         code_file.write_text(code, encoding='utf-8')
 
         self.logger.info(f"Executing code in {project_dir}")

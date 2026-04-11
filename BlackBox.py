@@ -1,11 +1,17 @@
 import asyncio
+import os
 import re
 import json
 import platform
+import string
 from operator import add # 配合Annotated使用，将里面的元素用+合并值
 
+import pandas as pd
+from anthropic import BaseModel
+from langchain_core.tools import tool
 from langgraph.config import get_stream_writer
-from pydantic.v1 import JsonError
+from pydantic import Field, field_validator
+from sqlalchemy import TypeDecorator
 
 from CodeManager import CodeDiffManager, ErrorSummarizer, CodeSandbox
 
@@ -17,27 +23,92 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 
 
-class CodeAgentState(TypedDict):
-    '''使用结构化数据而非自然语言描述
-    - 代码历史只保留最近3个版本
-    - 错误信息摘要而非完整堆栈跟踪
-    - 使用add_messages自动管理对话历史
+def excel_process(path):
+    try:
+        file = pd.read_excel(path, header=0)
+    except:
+        try:
+            file = pd.read_excel(path, header=0, engine='xlrd')
+        except Exception as e:
+            try:
+                file = pd.read_excel(path, header=0, engine='openpyxl')
+            except:
+                raise SystemError(f'ExcelError: {path} 文件损坏，打开失败。')
+    ret = []
+    columns = file.columns.tolist()
+    dtypes = file.dtypes
+    describe = file.describe(include=['object', 'bool', 'int', 'float'])
+    for col in columns:
+        ret.append(
+            f'- {col}({dtypes[col]}) 描述性统计:{describe[col].to_dict()} | NaN数量:{file[col].isnull().sum()}{f" | 唯一元素:{file[col].unique()}" if dtypes[col] == "object" else ""}'
+        )
+    return '\n'.join(ret)
+def csv_process(path):
+    try:
+        file = pd.read_csv(path, header=0, encoding='utf-8')
+    except:
+        try:
+            file = pd.read_csv(path, header=0, encoding='gbk')
+        except Exception as e:
+            raise SystemError(f'CsvError: {path} 文件损坏，打开失败。')
+    ret = []
+    columns = file.columns.tolist()
+    dtypes = file.dtypes
+    describe = file.describe(include=['object', 'bool', 'int', 'float'])
+    for col in columns:
+        ret.append(
+            f'- {col}({dtypes[col]}) 描述性统计:{describe[col].to_dict()} | NaN数量:{file[col].isnull().sum()}{f" | 唯一元素:{file[col].unique()}" if dtypes[col] == "object" else ""}'
+        )
+    return '\n'.join(ret)
+def process(path):
     '''
+    此工具用于查询指定csv或xlsx文件的元数据
+    返回字符串，描述了字段名称、类型、描述性统计、NaN值的数量
+    '''
+    end = str(path).split('.')[1]
+    if end == 'csv':
+        ret = csv_process(path)
+    elif end == 'xlsx':
+        ret = excel_process(path)
+    else:
+        raise ValueError(f'传入的文件后缀为{end}，但只能处理csv和xlsx后缀的文件。')
+    return ret
 
-    project_name: str
 
-    # 数据字段定义（结构化存储，减少token）
-    data_fields: List[Dict[str, str]]  # [{name, type, description}]
+def clean_json_response(text: str) -> str:
+    """
+    清理模型响应，移除代码块标记
+    """
+    # 移除 ```json 和 ``` 标记
+    cleaned = re.sub(r'```(?:json)?\n?|\n?```', '', text)
+
+    # 移除可能的多余空白字符
+    cleaned = cleaned.strip()
+
+    # 如果开头是 {，确保结尾是 }（处理可能的截断）
+    if cleaned.startswith('{') and not cleaned.endswith('}'):
+        # 尝试找到最后一个 }
+        last_brace = cleaned.rfind('}')
+        if last_brace != -1:
+            cleaned = cleaned[:last_brace + 1]
+
+    return cleaned
+
+
+class CodeAgentState(TypedDict):
+    files: List[str] # 读取的文件路径
+    step: int # 建模逻辑步骤数
 
     # 建模逻辑（精简描述）
     modeling_logic: str
 
+    # 文件字段说明
+    data_fields: str
+
     # 当前代码状态
     requirements: str
     current_code: str
-    parameter_schema: Dict # 要传入的参数说明
-    parameter: Dict # 交互传入的参数
-    input: bool # 是否要交互传入
+    paths: List[str]
 
     # 上一轮代码状态
     prev_code: str
@@ -48,8 +119,8 @@ class CodeAgentState(TypedDict):
         lambda left, right: (left or []) + (right or [])
     ]  # {stdout, stderr, exit_code}
 
-    # 改进建议
-    proposal: str
+    # 结果检查
+    valid_reason: str
 
     # 当前运行状态
     state: str # debug, success, complete, continue
@@ -57,10 +128,8 @@ class CodeAgentState(TypedDict):
     # 迭代控制
     iteration_count: int
     max_iterations: int
-
-
 class CodeGenerationAgent:
-    def __init__(self, model):
+    def __init__(self, model, sandbox):
         # 初始化LLM
         self.llm = model
         # 初始化检查点（支持多轮对话）
@@ -68,7 +137,8 @@ class CodeGenerationAgent:
         # 构建状态图
         self.graph = self._build_graph()
         # 构建沙盒
-        self.sandbox = CodeSandbox()
+        self.sandbox = sandbox
+        self.project_dir = self.sandbox.project_dir
         # 初始化 代码管理器 和 报错管理器
         self.codeManager = CodeDiffManager()
         self.errorManager = ErrorSummarizer()
@@ -77,18 +147,18 @@ class CodeGenerationAgent:
         workflow = StateGraph(CodeAgentState)
 
         # 添加节点
+        workflow.add_node("parse_node", self.parse_node)
         workflow.add_node("generate_code", self.generate_code)
-        workflow.add_node("params_input_node", self.params_input_node)
         workflow.add_node("execute_code", self.execute_code)
-        workflow.add_node("evaluate_result", self.evaluate_result)
         workflow.add_node("debug_and_fix", self.debug_and_fix)
+        workflow.add_node("evaluate_result", self.evaluate_result)
 
         # 设置入口
-        workflow.set_entry_point("generate_code")
+        workflow.set_entry_point("parse_node")
 
         # 添加边
-        workflow.add_edge("generate_code", "params_input_node")
-        workflow.add_edge("params_input_node", "execute_code")
+        workflow.add_edge("parse_node", "generate_code")
+        workflow.add_edge("generate_code", "execute_code")
         workflow.add_conditional_edges(
             "execute_code",
             self.should_debug,
@@ -102,7 +172,7 @@ class CodeGenerationAgent:
             "evaluate_result",
             self.should_continue,
             {
-                "continue": "debug_and_fix",
+                "continue": "execute_code",
                 "complete": END,
             }
         )
@@ -120,115 +190,128 @@ class CodeGenerationAgent:
         """决定是否继续优化"""
         return state['state']
 
+    def parse_node(self, state: CodeAgentState) -> CodeAgentState:
+        print(f'  ===> code_step{state["step"]}: 开始解析文件。')
+
+        ret = []
+        files = state['files']
+        for file in files:
+            desc = process(file)
+            ret.append(
+                f'文件:{file}\n{desc}'
+            )
+        ret = '\n'.join(ret)
+        print(ret)
+        return {"data_fields": ret}
+
     def generate_code(self, state: CodeAgentState) -> CodeAgentState:
         """生成Python代码"""
-        print(' >>> code_step: 开始生成代码。')
-        writer = get_stream_writer()
-        writer({'code_step': '开始生成代码。'})
-
-        # 构建数据说明
-        data_fields = "\n".join([
-            f"- {f['name']}: {f['type']} ({f['describe']})"
-            for f in state.get("data_fields", [])
-        ])
+        print(f'  ===> code_step{state["step"]}: 开始生成代码。')
 
         prompt = f"""
-你是一个专业的Python代码生成器。Python版本为{platform.python_version()}。
-*输入数据字段*
-{data_fields}
-
-*建模逻辑*
-{state['modeling_logic']}
-
-*要求*
-1. 代码必须包含完整的错误处理
-2. 添加必要的注释
-3. 生成两个文件，第一个为依赖库(requirements.txt)，第二个为完整的代码(main.py)
-4. 在*输出*区域内返回Python代码，不要解释。
-5. 需将所有步骤以及结果用print打印出来，方便后续根据print结果判断是否满足用户需求
-6. 尽量只用常见的库实现
-7. 若涉及到数据处理与建模，①需确保**使用的字段只涉及*输入数据说明*中提及的字段名**②不对数据的数量/质量、模型的拟合效果进行检查
-
-*代码格式*
-**1. requirements**: 只包含库的名称。
-**2. main**: 必须设置程序主入口'__main__'，并在里面调用函数。
-    函数所需的参数通过外部控制台传入，其中必须的参数是文件路径，因此需设置'sys.argv'接收外部传入参数。
-    如果需要画图，则也需要传入图片输出路径，并且每张图片的保存路径用其含义进行命名。
-    要画图，则必须导入包“plt.rcParams['font.sans-serif'] = ['SimHei'] plt.rcParams['axes.unicode_minus'] = False”
-
-*输出*
-- 返回可执行的requirements.txt在下面的标签中
-<require>
- # your requirements.txt
-</require>
-- 返回可执行的python代码在下面块中
-<python>
- # your python
-</python>
-- 返回sys.argv接收的参数列表在下面块中，严格以JSON格式展示。key为参数名称，value为该参数的含义。(若不需要传入，则可以为空)
-<parameter>
-{{"key": "value"}}
-</parameter>
-"""
+        你是一个专业的Python代码生成器。Python版本为{platform.python_version()}。
+        
+        *任务*
+        你需要读取文件，文件的字段解释在*字段描述*中，你需要根据*建模逻辑*，写出可执行的python文件。
+        
+        *字段描述*
+        {state['data_fields']}
+        
+        *建模逻辑*
+        {state['modeling_logic']}
+        
+        *要求*
+        1. 生成两个文件：依赖库文件requirements.txt和python可执行文件main.py。
+        2. requirements.txt要求:
+            - 需要更具python{platform.python_version()}版本选择不冲突的库。
+            - 尽量选择简单且使用人数多的库，以免出现bug。
+            - 必须是main中使用到的库。
+        3. main.py要求:
+            - 需要使用sys.argv依次接收两个参数: '结果csv文件输出目录'str,'图片输出目录'str
+            - 若*建模逻辑*里需要生成最终的文件，请将该文件放在'结果csv文件输出目录'下，并同样以csv格式保存
+            - 添加必要的注释，不需要设置错误处理机制，让bug充分暴露。
+            - 只能使用*字段描述*中提及的字段名，不对数据的数量/质量、运行的效果进行检查。
+            - 尽量选择简单且使用人数多的库，若遇到比较复杂或频繁bug的库，需考虑手动实现该功能。
+            - 必须导入包“plt.rcParams['font.sans-serif'] = ['SimHei'] plt.rcParams['axes.unicode_minus'] = False”
+            - 若需要保存dataframe，需确保保存的每一列都有名字(如果也要保存索引，则索引也得有名字)
+            - 路径分隔符无要求，推荐使用os.path.join
+            - 将执行过程的每一步按照指定格式print出来:
+                ①使用编号"12..."标记步骤名称，如"1.数据读取"，"2.数据预览"
+                ②说明该步骤的具体操作，如"读取了csv文件"，"使用describe进行了描述性统计"，"使用ARMA模型对字段year, gdp进行了建模"
+                ③使用output标识该步骤的结果，如"output:共100个样本", "output:描述性统计的结果为...", "output:相关性热力图输出到了路径D:/data/img.jpg"
+                ④每一步的完整格式为"1.相关性分析 n使用numpy对字段gdp和population进行了相关性分析，并将结果以热力图的方式可视化。output:热力图输出到了路径D:/data/img.jpg"
+            - 输出:
+                ①适当画图可视化，将图片输出到'图片输出目录'，图片以"步骤名称+图片含义"的方式命名，以jpg的格式输出。
+                ②最终生成的结果文件名(csv文件)(只包含文件名，如xxx.csv)
+        
+        *JSON格式要求*
+        1. 字符串必须用双引号包裹
+        2. 字符串中的双引号必须转义
+        3. 对象键必须用双引号包裹
+        4. 每个属性后必须有逗号（除了最后一个）
+        5. 布尔值必须是 true 或 false（小写）
+        6. 中文字符可以直接使用，但特殊字符需要转义
+        
+        *返回格式*
+        JSON是最外层且唯一的输出。
+        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
+        {{"requirements": "依赖库文件requirements", "python": "python可执行文件main", "path": ["若需要保存csv文件，保存的文件名称(csv格式)"]}}
+        """
         prompts = [
-        {'role': 'system', 'content': prompt},
-        {'role': 'user', 'content': f'按照要求在指定区域生成可执行的代码。'},
-    ]
+            {'role': 'system', 'content': prompt},
+        ]
+        class Code(BaseModel):
+            requirements: str = Field(description='依赖库文件requirements.txt', default="")
+            python: str = Field(description='python可执行文件main.py', default="")
+            path: List[str] = Field(description='若需要保存csv文件，保存的文件名称,储存在List里', default=[])
 
-        response = self.llm.invoke(prompts).content
+            @field_validator('requirements')
+            @classmethod
+            def requirements_check(cls, r: str) -> str:
+                """开头不是字母，则报错"""
+                if len(r) != 0:
+                    first_char = r[0]
+                    # 判断是否为空白字符（空格、制表符、换行等）
+                    if first_char.isspace():
+                        raise ValueError('格式错误: requirements文件以空白字符起始')
+                    # 判断是否为标点符号
+                    if first_char in string.punctuation:
+                        raise ValueError('格式错误: requirements文件以标点符号起始')
+                return r
 
-        # 提取requirements和python code
-        # 1. 提取 requirements
-        require_pattern = r"<require>(.*?)</require>"
-        require_match = re.search(require_pattern, response, re.DOTALL | re.MULTILINE)
-        requirements = require_match.group(1).strip() if require_match else ""
-        # 2. 提取python code
-        python_pattern = r"<python>(.*?)</python>"
-        python_match = re.search(python_pattern, response, re.DOTALL | re.MULTILINE)
-        code = python_match.group(1).strip() if python_match else ""
-        # 3. 提取输入的参数
-        parameter_pattern = r"<parameter>(.*?)</parameter>"
-        parameter_match = re.search(parameter_pattern, response, re.DOTALL | re.MULTILINE)
-        parameter = parameter_match.group(1).strip() if parameter_match else ""
-        parameter = json.loads(parameter.strip())
+            @field_validator('python')
+            @classmethod
+            def python_check(cls, p: str) -> str:
+                """开头不是import from"""
+                if len(p) != 0:
+                    first_char = p[0]
+                    # 判断是否为空白字符（空格、制表符、换行等）
+                    if first_char.isspace():
+                        raise ValueError('格式错误: python文件格式有误，以空白字符起始，预期以import/from起始')
+                    # 判断是否为标点符号
+                    if first_char in string.punctuation:
+                        raise ValueError('格式错误: python文件格式有误，以标点符号起始，预期以import/from起始')
+                return p
 
+        raw_response = self.llm.invoke(prompts)
+        raw_content = raw_response.content
+        cleaned_content = clean_json_response(raw_content)  # 清理响应
+        data = json.loads(cleaned_content)
+        response = Code(**data)
 
         return {
-            "data_fields": data_fields,
-            "requirements": requirements,
-            "current_code": code,
-            "parameter_schema": parameter,
-            "input": True if parameter else False,
-            "iteration_count": state.get("iteration_count", 0) + 1
+            "requirements": response.requirements,
+            "current_code": response.python,
+            "iteration_count": state.get("iteration_count", 0) + 1,
+            "paths": response.path,
         }
-
-    def params_input_node(self, state: CodeAgentState) -> CodeAgentState:
-        '''交互节点，可以人为传递函数参数'''
-        print(f' >>> code_step: 交互传递参数。')
-        writer = get_stream_writer()
-        writer({'code_step': '交互传递参数。'})
-
-        if_input = state['input']
-        parameter_schema = state['parameter_schema']
-        parameter_str = '\n'.join([''.join([key, ':', value]) for key, value in parameter_schema.items()])
-        if if_input:
-            response = interrupt(
-                f"为运行Python代码，需要传入参数：\n{parameter_str}"
-            )
-            return {"parameter": response}
-        return {}
-
 
     def execute_code(self, state: CodeAgentState) -> CodeAgentState:
         """在沙箱中执行代码"""
-        print(' >>> code_step: 开始执行代码。')
-        writer = get_stream_writer()
-        writer({'code_step': '开始执行代码。'})
-
-        project_dir = self.sandbox.create_project(state.get('project_name', None))
-        install_res = self.sandbox.install_dependencies(project_dir, state["requirements"])
+        print(f'  ===> code_step{state["step"]}: 开始执行代码。')
+        install_res = self.sandbox.install_dependencies(self.project_dir, state['step'], state["requirements"])
         if install_res['success']:
-            execute_res = self.sandbox.execute_code(project_dir, list(state.get("parameter", {}).values()), state["current_code"])
+            execute_res = self.sandbox.execute_code(self.project_dir, [(self.project_dir/"data"), (self.project_dir/"img")], state["current_code"], state['step'])
             return {
                 "execution_result": [
                     {
@@ -254,229 +337,421 @@ class CodeGenerationAgent:
     def debug_and_fix(self, state: CodeAgentState) -> CodeAgentState:
         """调试和修复"""
 
-        print(f' >>> code_step: 开始调试和修复代码(Iteration {state.get("iteration_count", 0)})。')
-        writer = get_stream_writer()
-        writer({'code_step': f'开始调试和修复代码(Iteration {state.get("iteration_count", 0)})。'})
-        print(state['execution_result'][-1]['stdout'])
+        print(f'  ===> code_step{state["step"]}: 开始调试和修复代码(Iteration {state.get("iteration_count", 0)})。')
+        print(state['execution_result'][-1]['stderr'])
 
         requirements = state['requirements']
         current_code = state['current_code']
 
-        if state["state"] == "debug":
-            prev_code = state.get('prev_code', '')
-            stdout = []
-            stderr = []
-            for i, res in enumerate(state["execution_result"]):
-                stdout.append(res['stdout'])
-                stderr.append(res['stderr'])
-            # 生成错误摘要
-            errorSummary = self.errorManager.summarize_errors(stderr)
-            # 生成代码变更摘要
-            if prev_code:
-                codeDiff = self.codeManager.get_diff_summary(prev_code, current_code)
-                if codeDiff['diff_lines'] > 30:
-                    codeDiff = prev_code
-                elif not codeDiff['has_changes']:
-                    codeDiff = ''
-                else:
-                    codeDiff = f'''
-    新增行数: {codeDiff['added_lines_count']}
-    删除行数: {codeDiff['removed_lines_count']}
-    修改的函数: {' '.join(codeDiff['changed_functions'])}
-    '''
-            else:
+        # 整理之前的代码结果
+        prev_code = state.get('prev_code', '')
+        stdout = []
+        stderr = []
+        for i, res in enumerate(state["execution_result"]):
+            stdout.append(res['stdout'])
+            stderr.append(res['stderr'])
+        # 生成错误摘要
+        errorSummary = self.errorManager.summarize_errors(stderr)
+        # 生成代码变更摘要
+        if prev_code:
+            codeDiff = self.codeManager.get_diff_summary(prev_code, current_code)
+            if codeDiff['diff_lines'] > 30:
+                codeDiff = prev_code
+            elif not codeDiff['has_changes']:
                 codeDiff = ''
-            # 数据说明
-            data_fields = state.get("data_fields", "")
-            prompt = f'''
-你是一个代码调试专家。分析以下错误并提供具体的修复建议和修改后的代码。
-
-*当前依赖*:
-{requirements}
-
-*当前代码*:
-{state["current_code"]}
-
-*当前代码sys.argv接收的参数*
-{state["parameter_schema"]}
-
-*当前错误*:
-{stderr[-1]}
-
-*当前结果*
-{stdout[-1]}
-
-*历史代码变更*:
-{codeDiff}
-
-*历史报错*:
-{errorSummary}
-
-*建模逻辑*:
-{state['modeling_logic']}
-
-*输入数据说明*
-{data_fields}
-
-*要求*:
-1. 代码必须包含完整的错误处理
-2. 添加必要的注释
-3. 生成两个文件，第一个为依赖库(requirements)，第二个为完整的代码(main)
-4. 在*输出*区域内返回Python代码，不要解释。
-5. 需将所有步骤以及结果用print打印出来，方便后续根据print结果判断是否满足用户需求
-6. 代码中只能使用*输入数据字段*中的数据字段
-7. 需保证修改后的代码仍然能通过'sys.argv'接收相同的参数
-8. 若代码中涉及到数据处理和建模，需确保**使用的字段只涉及*输入数据说明*中提及的字段名**
-9. 尽量只用常见的库实现
-
-*代码格式*:
-**1. requirements**: 只包含库的名称。
-**2. main**: 必须设置程序主入口'__main__'，并在里面调用函数。函数所需的参数通过外部控制台传入，其中必须的参数是文件路径，因此需设置'sys.argv'接收外部传入参数。
-
-*输出*:
-- 返回可执行的requirements.txt在下面的标签中
-<require>
- # your requirements.txt
-</require>
-- 返回可执行的python代码在下面块中
-<python>
- # your python
-</python>
-'''
+            else:
+                codeDiff = f'''
+                新增行数: {codeDiff['added_lines_count']}
+                删除行数: {codeDiff['removed_lines_count']}
+                修改的函数: {' '.join(codeDiff['changed_functions'])}
+                '''
         else:
-            prompt = f'''
-你是一个代码调试专家。分析以下错误并提供具体的修复建议和修改后的代码。
+            codeDiff = ''
 
+        prompt = f'''
+        你是一个Python代码调试专家，Python版本为{platform.python_version()}。分析以下错误修改代码。
+        
+        *说明*
+        - *当前代码*为根据*建模逻辑*，使用*输入数据说明*中的字段进行数据处理与建模的代码。
+        - *当前错误*为当前代码的报错，*当前结果*为当前代码的输出结果。
+        - *历史代码变更*为上一版本的代码修改过的信息。
+        - *历史报错*为历史版本的代码出现过的报错信息。
+        
+        *当前依赖*
+        {requirements}
+        
+        *当前代码*
+        {state["current_code"]}
+        
+        *当前错误*
+        {stderr[-1]}
+        
+        *当前结果*
+        {stdout[-1]}
+        
+        *历史代码变更*:
+        {codeDiff}
+        
+        *历史报错*:
+        {errorSummary}
+        
+        *建模逻辑*:
+        {state['modeling_logic']}
+        
+        *输入数据说明*
+        {state["data_fields"]}
+        
+        *要求*:
+        1. 只针对代码的报错进行修改，返回修改后的依赖库文件requirements.txt和python可执行文件main.py
+        2. main.py要求:
+            - 确保使用sys.argv接收两个个参数: '结果csv文件输出目录'str,'图片输出目录'str
+            - 添加必要的注释，不需要设置错误处理机制，让bug充分暴露。
+            - 若需要保存dataframe，需确保保存的每一列都有名字(如果也要保存索引，则索引也得有名字)
+            - 若*建模逻辑*里需要生成最终的文件，请将该文件放在'结果csv文件输出目录'下，并同样以csv格式保存
+            - 尽量选择简单且使用人数多的库，若遇到比较复杂或频繁bug的库，需考虑手动实现该功能。
+            - 路径分隔符无要求，推荐使用os.path.join
+            - 必须导入包“plt.rcParams['font.sans-serif'] = ['SimHei'] plt.rcParams['axes.unicode_minus'] = False”
+            - **保留原代码的print输出逻辑和结果、画图结果、sys.argv按要求正确接收参数**
+        
+        *JSON格式要求*
+        1. 字符串必须用双引号包裹
+        2. 字符串中的双引号必须转义
+        3. 对象键必须用双引号包裹
+        4. 每个属性后必须有逗号（除了最后一个）
+        5. 布尔值必须是 true 或 false（小写）
+        6. 中文字符可以直接使用，但特殊字符需要转义
+        
+        *返回格式*
+        JSON是最外层且唯一的输出。
+        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
+        {{"requirements": "依赖库文件requirements", "python": "python可执行文件main", "path": ["若需要保存csv文件，保存的文件名称(csv格式)"]}}
+        '''
 
-*建模逻辑*:
-{state['modeling_logic']}
-
-*输入数据说明*
-{state.get("data_fields", "")}
-
-*代码*
-{state["current_code"]}
-
-*代码sys.argv接收的参数*
-{state["parameter_schema"]}
-
-*代码输出*
-{state["execution_result"][-1]["stdout"]}
-
-*修改建议*
-{state['proposal']}
-
-*要求*:
-1. 代码必须包含完整的错误处理
-2. 添加必要的注释
-3. 在*输出*区域内返回Python代码，不要解释。
-4. 需将所有步骤以及结果用print打印出来，方便后续根据print结果判断是否满足用户需求
-5. 代码中只能使用*输入数据字段*中的数据字段
-6. 需保证修改后的代码仍然能通过'sys.argv'接收相同的参数
-7. 若代码中涉及到数据处理和建模，需确保**使用的字段只涉及*输入数据说明*中提及的字段名**
-9. 尽量只用常见的库实现
-
-*代码格式*:
-必须设置程序主入口'__main__'，并在里面调用函数。函数所需的参数通过外部控制台传入，其中一个必须的参数是文件路径，因此需设置'sys.argv'接收外部传入参数。
-
-*输出*:
-- 返回可执行的python代码在下面块中
-<python>
- # your python
-</python>
-'''
         prompts = [
             {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': '请根据错误建议提供修正的代码。'}
         ]
 
-        response = self.llm.invoke(prompts).content
-        # 提取requirements和python code
-        # 1. 提取 requirements
-        require_pattern = r"<require>(.*?)</require>"
-        require_match = re.search(require_pattern, response, re.DOTALL | re.MULTILINE)
-        requirements = require_match.group(1).strip() if require_match else ""
-        # 2. 提取python code
-        python_pattern = r"<python>(.*?)</python>"
-        python_match = re.search(python_pattern, response, re.DOTALL | re.MULTILINE)
-        code = python_match.group(1).strip() if python_match else ""
+        class Code(BaseModel):
+            requirements: str = Field(description='依赖库文件requirements.txt', default="")
+            python: str = Field(description='python可执行文件main.py', default="")
+            path: List[str] = Field(description='若需要保存csv文件，保存的文件名称(如xxx.csv),储存在List里', default=[])
+
+            @field_validator('requirements')
+            @classmethod
+            def requirements_check(cls, r: str) -> str:
+                """开头不是字母，则报错"""
+                if len(r) != 0:
+                    first_char = r[0]
+                    # 判断是否为空白字符（空格、制表符、换行等）
+                    if first_char.isspace():
+                        raise ValueError('格式错误: requirements文件以空白字符起始')
+                    # 判断是否为标点符号
+                    if first_char in string.punctuation:
+                        raise ValueError('格式错误: requirements文件以标点符号起始')
+                return r
+
+            @field_validator('python')
+            @classmethod
+            def python_check(cls, p: str) -> str:
+                """开头不是import from"""
+                if len(p) != 0:
+                    first_char = p[0]
+                    # 判断是否为空白字符（空格、制表符、换行等）
+                    if first_char.isspace():
+                        raise ValueError('格式错误: python文件格式有误，以空白字符起始，预期以import/from起始')
+                    # 判断是否为标点符号
+                    if first_char in string.punctuation:
+                        raise ValueError('格式错误: python文件格式有误，以标点符号起始，预期以import/from起始')
+                return p
+
+        raw_response = self.llm.invoke(prompts)
+        raw_content = raw_response.content
+        cleaned_content = clean_json_response(raw_content)  # 清理响应
+        data = json.loads(cleaned_content)
+        response = Code(**data)
 
         return {
-            "requirements": requirements if requirements else state["requirements"],
-            "current_code": code,
-            "prev_code": current_code,
+            "requirements": response.requirements if response.requirements else state["requirements"],
+            "current_code": response.python if response.python else state["current_code"],
+            "prev_code": current_code if response.python else state.get("prev_code", current_code),
             "iteration_count": state.get("iteration_count", 0) + 1,
+            "paths": response.path if response.path else state["paths"],
         }
 
-
     def evaluate_result(self, state: CodeAgentState) -> CodeAgentState:
-        """评估执行结果是否满足需求"""
+        print(f'  ===> code_step{state["step"]}: 开始校验输出')
 
-        print(f' >>> code_step: 开始评估代码完整性。')
-        writer = get_stream_writer()
-        writer({'code_step': '开始评估代码完整性。'})
+        stdout = state["execution_result"][-1]["stdout"]
+        paths = state["paths"]
 
-        # 如果成功，检查是否满足需求
         prompt = f'''
-评估代码执行结果是否满足原始需求。
+        你是一个专业的Python代码逻辑校验工具。
+        *背景描述*
+        当前python*代码*使用sys.argv接收了参数，运行得到*输出*{",并输出文件保存在*输出文件路径*中" if paths else ""}。
+        *任务*
+        请你根据*要求*判断 代码 和 输出文件路径(若存在) 是否合理，若不合理，则给出微调后的代码和输出文件路径。注意，保留代码的结构逻辑不能删减。
+        
+        *代码*
+        {state["current_code"]}
+        *输出*
+        {stdout}
+        *输出文件名称*
+        {paths}
+        *要求*
+        1. 代码执行过程的每一步需指定格式print出来:
+            ①使用编号"1、2..."标记步骤名称，如"1.数据读取"，"2.数据预览"
+            ②说明该步骤的具体操作，如"读取了csv文件"，"使用describe进行了描述性统计"，"使用ARMA模型对字段year, gdp进行了建模"
+            ③使用output标识该步骤的结果，如"output:共100个样本", "output:描述性统计的结果为...", "output:相关性热力图输出到了路径D:/data/img.jpg"
+            ④每一步的完整格式为"1.相关性分析 n使用numpy对字段gdp和population进行了相关性分析，并将结果以热力图的方式可视化。output:热力图输出到了路径D:/data/img.jpg"
+        2. 适当画图可视化，将图片输出到'图片输出目录'，图片以"步骤名称+图片含义"的方式命名，以jpg的格式输出。
+        3. 需要使用sys.argv依次接收两个参数: '结果csv文件输出目录'str,'图片输出目录'str。
+        4. 若最终生成保存了文件，请将该文件放在'结果csv文件输出目录'下，并同样以csv格式保存。
+        5. 若代码需要保存dataframes，需确保保存的每一列都有名字(如果也要保存索引，则索引也得有名字)
+        6. 路径分隔符无要求，推荐使用os.path.join
+        7. 不检查代码计算结果的合理性（如计算的数值失真，假设检验值异常等），只要代码逻辑正确
+        
+        *JSON格式要求*
+        1. 字符串必须用双引号包裹
+        2. 字符串中的双引号必须转义
+        3. 对象键必须用双引号包裹
+        4. 每个属性后必须有逗号（除了最后一个）
+        5. 布尔值必须是 true 或 false（小写）
+        6. 中文字符可以直接使用，但特殊字符需要转义
+        
+        *返回格式*
+        JSON是最外层且唯一的输出。
+        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
+        {{"valid": "代码是否符合要求，输出'符合'或'不符合'", "python": "若代码不符合要求，微调后的python代码", "path": ["若存在，代码中保存csv文件名(csv格式)"], "reason": "你的判断理由"}}
+        '''
 
-*建模步骤*:
-{state['modeling_logic']}
-
-*最终结果*
-{state["execution_result"][-1]["stdout"]}
-
-*任务*
-1. *最终结果*为代码print的结果，展示了代码的执行过程。
-2. 判断最终结果是否满足*建模步骤*。只需对建模步骤的完整性进行评估，即检查建模逻辑中的步骤是否都有相应的输出结果，而不需对运行结果的合理性和建模结果的好坏进行评估（哪怕结果不合理，但只要步骤完整，也认为满足）。
-3. 最后输出一个JSON格式，包含两项:
-- valid: Yes/No(建模步骤是否完整) 
-- reason: 简述原因
-
-*输出*: 严格遵循JSON的格式，不要有任何其他内容和其他形式的输出，输出的格式如下。
-{{"valid": "", "reason": ""}}
-'''
         prompts = [
             {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': '请严格遵守要求输出结果。'}
         ]
+        class Reason(BaseModel):
+            valid: str = Field(description="代码是否符合要求，输出'符合'或'不符合'", default="符合")
+            python: str = Field(description='若代码不符合要求，微调后的python代码', default="")
+            path: List[str] = Field(description='代码中保存csv文件名(若存在),放在列表里', default=[])
+            reason: str = Field(description='你的判断理由', default="")
 
-        response = self.llm.invoke(prompts).content
-        json_response = {"valid": "no", "reason": ""}
-        try:
-            j = json.loads(response)
-            for key, value in j.items():
-                json_response[key.lower()] = value.lower()
-        except Exception as e:
-            raise JsonError(f'plan node "JSON loads error": {e}:')
+        raw_response = self.llm.invoke(prompts)
+        raw_content = raw_response.content
+        cleaned_content = clean_json_response(raw_content) # 清理响应
+        data = json.loads(cleaned_content)
+        response = Reason(**data)
 
-        print(f' >>> code_step: 代码评估结果为: {json_response["valid"]}。原因: {json_response["reason"]}')
-        writer({'code_step': f'代码评估结果为: {json_response["valid"]}。原因: {json_response["reason"]}'})
+        print(f'生成文件: {paths}')
+        print(f'评估原因:{response.reason}')
 
-        if json_response["valid"] == "yes":
-            return {
-                "state": "complete",
-            }
-        else:
-            return {
-                "state": "continue",
-                "proposal": json_response["reason"],
-            }
+        return {
+            "state": "complete" if response.valid == "符合" else "continue",
+            "current_code": response.python if not (response.valid == "符合") else state["current_code"],
+            "paths": response.path if not (response.valid == "符合") else state["paths"],
+        }
 
     def run_with_user_interaction(
             self,
+            files: List[str],
             thread_id: str,
-            project_name: str,
-            data_fields: List[Dict[str, str]],
             modeling_logic: str,
+            step: int,
             max_iterations: int = 5,
     ):
         """运行图并处理用户交互"""
         initial_state = {
-            "project_name": project_name,
-            "data_fields": data_fields,
             "modeling_logic": modeling_logic,
             "max_iterations": max_iterations,
+            "step": step,
+            "files": files,
+        }
+        config = {
+            'configurable': {
+                'thread_id': thread_id,
+            }
+        }
+
+        # 开始执行
+        for trunk in self.graph.stream(
+                initial_state,
+                config,
+        ):
+            # print(trunk)
+            # 检查是否有中断，有则调用函数输入参数
+            # if "__interrupt__" in trunk:
+            #     cmd = self.parameter_input()
+            #     if cmd:
+            #         for resume_trunk in self.graph.stream(cmd, config):
+            #             # print(resume_trunk)
+            #             continue
+            continue
+
+        # 返回最终代码执行结果
+        state = self.graph.get_state(config).values
+        x = state.get("execution_result", "")
+        if x:
+            return (state.get("paths", []), x[-1]['stdout'])
+        else:
+            return ("未返回任何结果。", "未返回任何结果。")
+
+
+    def parameter_input(self):
+        '''定义: Command函数根据需求传入函数参数'''
+        # parameter_schema = self.graph.get_state(config).values.get("parameter_schema", {})
+        response = input(f'是否准备好数据(Yes/No)(路径为{self.project_dir/"data"}):')
+        response = response.strip().title()
+        return Command(resume=response)
+
+
+def code(model, sandbox, files, thread_id, modeling_logic, step):
+    '''将CodeGenerationAgent包装成一个函数'''
+    agent = CodeGenerationAgent(model, sandbox)
+    out_files, outcome = agent.run_with_user_interaction(
+        files=files,
+        thread_id=thread_id,
+        modeling_logic=modeling_logic,
+        step=step
+    )
+    return {
+        "out_files": out_files,
+        "outcome": outcome,
+    }
+
+
+class CodeState(TypedDict):
+    modeling_logic: str
+    data_fields: List[Dict[str,str]]
+    steps_all: int
+    files: List[str]
+
+    # 初始数据的描述性统计
+    init_files: List[str]
+    # 当前为第几步
+    step: int
+    # 规划的编程步骤
+    modeling_steps: List[str]
+    # 执行结果
+    outcome_steps: Annotated[
+        List[str],
+        lambda left, right: (left or []) + (right or [])
+    ]
+
+class CodeAgent:
+    def __init__(self, model, project_name, base_workspace: str="D:\\AiProgram\\Thesis"):
+        # 初始化LLM
+        self.llm = model
+        # 初始化检查点（支持多轮对话）
+        self.checkpointer = MemorySaver()
+        # 构建状态图
+        self.graph = self._build_graph()
+        self.sandbox = CodeSandbox(base_workspace=base_workspace)
+        self.project_dir = self.sandbox.create_project(project_name)
+
+    def _build_graph(self):
+        workflow = StateGraph(CodeState)
+        workflow.add_node('program_node', self.program_node)
+        workflow.add_node('code_node', self.code_node)
+
+        workflow.set_entry_point("program_node")
+        workflow.add_edge('program_node', 'code_node')
+        workflow.add_conditional_edges(
+            'code_node',
+            self.route_func,
+            {
+                "continue": 'code_node',
+                "complete": END,
+            }
+        )
+        # 编译图
+        return workflow.compile(checkpointer=self.checkpointer)
+
+    def route_func(self, state: CodeState):
+        '''判断是否还有未完成的规划'''
+        steps_all = state["steps_all"]
+        step = state["step"]
+        if step <= steps_all:
+            return "continue"
+        else:
+            return "complete"
+
+    def program_node(self, state: CodeState) -> CodeState:
+        print(' >> code_step: 开始规划编程')
+
+        # 等待用户准备数据
+        cont = interrupt(
+            f"数据是否已经准备(Yes/No)，项目目录为{self.project_dir}?"
+        )
+        if cont == 'Yes':
+            pass
+        else:
+            raise ValueError('数据未准备好！')
+
+        # 准备好的数据文件名
+        files_name = os.listdir(self.project_dir / 'data')
+        files = []
+        for name in files_name:
+            if '.' in name:
+                files.append(self.project_dir / 'data' / name)
+        print(f'读取到的文件: {files}')
+
+        data_fields = "\n".join([
+            f"- {f['name']}: {f['type']} ({f['describe']})"
+            for f in state.get("data_fields", [])
+        ])
+
+        prompt = f'''
+        你是一个专业的Python编程专家。
+        *任务*
+        给定*编程需求*和*传入的数据*，其中*传入的数据*对可用的数据字段、类型、描述进行了定义，利用该数据实现去*编程需求*。你需要将*编程需求*细化拆分为可执行的多个步骤。
+        *编程需求*
+        {state["modeling_logic"]}
+        *传入的数据*
+        {data_fields}
+        *要求*
+        1. 将*编程需求*细化为可实现的3-5个步骤，不能出现"基于前一个步骤"，"在步骤2的基础上"这类的词。
+        2. 只能使用*传入的数据*提及的数据字段，不能使用未提及的字段进行辅助数据处理或建模等。
+        3. 在对数据进行处理和建模时，需明确指定数据字段名。
+        4. 每个步骤结束后，需指定要保存的全部数据字段（保存为csv文件），该数据文件将作为下一步骤的传入数据，因此需保证前后步骤数据字段的完整性和一致性。
+        5. 每个步骤都需要定义明确的执行内容和使用的字段名，包括使用的模型、使用到的*传入的数据*的字段名、建模方法等。
+        6. 若没有更好的想法，可将步骤分为: 数据预处理、建模步骤一、建模步骤二...
+        *输出格式*
+        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:。
+        {{"plan": ["规划的3-5个编程步骤"]}}
+        '''
+
+        prompts = [
+            {"role": "system", "content": prompt},
+        ]
+        class Program(BaseModel):
+            plan: List[str] = Field(description="规划的3-5个编程步骤，以List形式存储")
+
+        structured_model = self.llm.with_structured_output(Program)
+        response = structured_model.invoke(prompts)
+
+        print(response.plan)
+
+        return {"modeling_steps": response.plan, "steps_all": len(response.plan), "step": 1, "files": files, "init_files": [str(f) for f in files]}
+
+    def code_node(self, state: CodeState) -> CodeState:
+        step = state["step"]
+        print(f' >> code_step: 开始编程步骤{step}')
+        ret = code(self.llm, self.sandbox, state["files"], str(step), state["modeling_steps"][step-1], step)
+
+        dir_name = self.project_dir / 'data'
+        files = []
+        for name in ret["out_files"]:
+            if '.' in name:
+                files.append(dir_name / name)
+        return {"files": files, "outcome_steps": [ret["outcome"]], "step": state["step"]+1}
+
+    def run_with_user_interaction(
+            self,
+            modeling_logic: str,
+            data_fields: List,
+            thread_id: str,
+    ):
+        """运行图并处理用户交互"""
+        initial_state = {
+            "modeling_logic": modeling_logic,
+            "data_fields": data_fields,
         }
         config = {
             'configurable': {
@@ -492,51 +767,51 @@ class CodeGenerationAgent:
             # print(trunk)
             # 检查是否有中断，有则调用函数输入参数
             if "__interrupt__" in trunk:
-                cmd = self.parameter_input(config)
+                cmd = self.parameter_input()
                 if cmd:
                     for resume_trunk in self.graph.stream(cmd, config):
                         # print(resume_trunk)
                         continue
+            continue
 
         # 返回最终代码执行结果
-        x = self.graph.get_state(config).values.get("execution_result", "")
-        if x:
-            return x[-1]['stdout']
-        else:
-            return "未返回任何结果。"
+        state = self.graph.get_state(config).values
+        outcome = state.get("outcome_steps", []) # 代码执行结果
+        init_files = state.get("init_files", []) # 初始数据的路径
+        modeling_steps = state.get("modeling_steps", []) # 建模详细步骤
+        return {"outcome": outcome, "init_files": init_files, "modeling_steps": modeling_steps}
 
-
-    def parameter_input(self, config):
+    def parameter_input(self):
         '''定义: Command函数根据需求传入函数参数'''
-        parameter_schema = self.graph.get_state(config).values.get("parameter_schema", {})
-        if not parameter_schema:
-            return
-
-        response = {}
-        for key, value in parameter_schema.items():
-            response[key] = input(f'{key}({value}):')
+        # parameter_schema = self.graph.get_state(config).values.get("parameter_schema", {})
+        response = input(f'是否准备好数据(Yes/No)(路径为{self.project_dir/"data"}):')
+        response = response.strip().title()
         return Command(resume=response)
 
 
 
 
-if __name__ == '__main__':
-    from langchain_openai import ChatOpenAI
-    API_KEY = 'sk-a6647968836d4d9587d9adb77e659727'
-    # 使用langchain创建访问OpenAI的Model。
-    model = ChatOpenAI(
-        model="qwen3-coder-next",
-        openai_api_key=API_KEY,
-        openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        temperature=0.7
-    )
-    agent = CodeGenerationAgent(model)
-    result = agent.run_with_user_interaction(
-        '1',
-        'Finance',
-        [{'name': 'country_id', 'type': 'string', 'describe': '国家ISO三位代码，用于标识观测单位'}, {'name': 'year', 'type': 'integer', 'describe': '年份，范围为1960–2022'}, {'name': 'gdp_growth', 'type': 'float', 'describe': '实际GDP年增长率（%），来源于World Bank WDI'}, {'name': 'gdp_per_capita_growth', 'type': 'float', 'describe': '实际人均GDP年增长率（%），来源于World Bank WDI'}, {'name': 'pop_total', 'type': 'float', 'describe': '总人口（百万），来源于UN World Population Prospects'}, {'name': 'pop_15_64', 'type': 'float', 'describe': '15–64岁人口（百万），来源于UN World Population Prospects'}, {'name': 'pop_65plus', 'type': 'float', 'describe': '65岁及以上人口（百万），来源于UN World Population Prospects'}, {'name': 'pop_0_14', 'type': 'float', 'describe': '0–14岁人口（百万），来源于UN World Population Prospects'}, {'name': 'life_expectancy', 'type': 'float', 'describe': '出生时预期寿命（岁），来源于IHME GBD'}, {'name': 'schooling_mean', 'type': 'float', 'describe': '25岁以上人口平均受教育年限（年），来源于Barro-Lee dataset'}, {'name': 'invest_ratio', 'type': 'float', 'describe': '国内总投资占GDP比重（%），来源于World Bank WDI'}, {'name': 'gov_consumption', 'type': 'float', 'describe': '政府最终消费支出占GDP比重（%），来源于World Bank WDI'}, {'name': 'trade_openness', 'type': 'float', 'describe': '进出口总额占GDP比重（%），来源于World Bank WDI'}, {'name': 'support_ratio', 'type': 'float', 'describe': '支持比，计算式为 pop_15_64 / (pop_0_14 * 0.3 + pop_65plus * 0.8 + pop_15_64 * 1.0)，其中0.3、0.8、1.0为UN Age-Specific Consumption Weights'}, {'name': 'old_dependency_ratio', 'type': 'float', 'describe': '老年抚养比，计算式为 pop_65plus / pop_15_64'}, {'name': 'young_dependency_ratio', 'type': 'float', 'describe': '少儿抚养比，计算式为 pop_0_14 / pop_15_64'}, {'name': 'human_capital_density', 'type': 'float', 'describe': '人力资本密度，计算式为 schooling_mean * (pop_15_64 / pop_total)'}, {'name': 'log_pop_total', 'type': 'float', 'describe': '总人口自然对数，即 log(pop_total)'}],
-        '采用两阶段估计策略：第一阶段使用系统广义矩估计（System GMM）估计动态面板模型 gdp_growth_it = α + β1·gdp_growth_i,t−1 + β2·support_ratio_it + β3·old_dependency_ratio_it + β4·log_pop_total_it + β5·human_capital_density_it + γ·X_it + μ_i + ε_it，其中X_it为invest_ratio、gov_consumption、trade_openness等控制变量，μ_i为国家固定效应，ε_it为扰动项；工具变量集包括所有解释变量的二阶及更高阶滞后项（差分形式）与被解释变量的滞后二阶差分；第二阶段对old_dependency_ratio进行门槛回归，以gdp_growth为因变量，以old_dependency_ratio为门槛变量，识别其对GDP增长影响发生结构性突变的临界值，并检验门槛效应的显著性（Bootstrap法）。所有模型均在Python中通过linearmodels库实现系统GMM估计，通过thresholdmodels库实现门槛回归；数据清洗与特征工程（如support_ratio、human_capital_density、log_pop_total的构造）使用pandas完成，缺失值采用多重插补（fancyimpute）处理。'
-    )
-    print(result)
+# if __name__ == '__main__':
+#     from langchain_openai import ChatOpenAI
+#     API_KEY = 'sk-a6647968836d4d9587d9adb77e659727'
+#     # 使用langchain创建访问OpenAI的Model。
+#     model = ChatOpenAI(
+#         model="qwen3-coder-next",
+#         openai_api_key=API_KEY,
+#         openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+#         temperature=0.7,
+#         response_format={"type": "json_object"}
+#     )
+#     agent = CodeAgent(model, "Finance")
+#     result = agent.run_with_user_interaction(
+#         "使用最小二乘法对数据建模，探寻GDP与人口的关系。首先对population进行正态性检验和标准化，去除空值等预处理操作。然后，建立对ggp和population建立线性模型。最后，对拟合效果进行分析，如R2、残差、残差正态性检验等。",
+#         [
+#             {"name": 'year', 'type': 'int', "describe": '样本年份'},
+#             {"name": 'gdp', 'type': 'float', "describe": '当年国家的gdp'},
+#             {"name": 'population', 'type': 'int', "describe": '当年国家的人口数量'},
+#         ],
+#         '1',
+#     )
+#     print(result)
 
 

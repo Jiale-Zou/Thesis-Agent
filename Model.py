@@ -34,7 +34,8 @@ def qwen_code(temperature=0.7):
         model="qwen3-coder-next",
         openai_api_key=API_KEY,
         openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        temperature=temperature
+        temperature=temperature,
+        response_format={"type": "json_object"}
     )
     return model
 
