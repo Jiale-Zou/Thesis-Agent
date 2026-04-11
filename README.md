@@ -1,15 +1,54 @@
-*codeManager.py*: 
-Contain three modules
-'CodeSandbox' is a blackbox to execute py code locally, 'CodeDiffManager' used to analyse the difference of two code version, 'ErrorSummarizer' used to summarize the execute error of codes.
+# 项目简介
+这是一个基于LangGraph架构的论文撰写智能助手。该系统通过主Agent协调多个专业子任务，自动化完成从主题确定到最终论文生成的完整流程。系统特别强化了代码生成与执行能力，能够根据建模思路自动创建、调试和运行代码，并将结果整合到论文中。
+# 一、系统架构
+## 模型架构
+### 1. 主Agent (论文撰写核心)
+负责整体论文撰写流程，包含以下关键步骤：
+- 主题与关键词确定
+- 文献检索与分析
+- 建模思路形成
+- 代码生成与执行协调
+- 正文内容撰写
+- Markdown转PDF格式转换
+### 2. 子Agent (代码生成与执行)
+专用于代码相关任务：
+- 创建黑盒实验环境
+- 根据建模思路自动生成代码
+- 代码调试与错误修复
+- 代码执行与结果收集
+## 文件架构
+├── BlackBox.py              # 代码Agent实现（子Agent），负责代码生成与执行<br>
+├── CodeManager.py          # 核心管理类，包含：<br>
+│   ├── 黑盒环境类<br>
+│   ├── 代码差异分析类<br>
+│   └── 报错分析类<br>
+├── Model.py                # LLM接口封装<br>
+├── sup_agent.py            # 论文Agent（主Agent）<br>
+├── mcp_config.json         # MCP服务配置<br>
+└── config.json             # 项目运行参数配置<br>
+# 二、前置工具要求
+在运行本项目前，请确保已安装以下工具：
+- uv：Python包管理器和安装工具
+- pandoc：文档格式转换工具
+- MiKTeX：LaTeX发行版（Windows用户）
+- Node.js：JavaScript运行环境，包含 mmdc​ (Mermaid CLI) 用于图表生成
+# 三、运行依赖库
+langchain, langgraph, pypandoc
+# 四、迭代
+## V1:
+1. 主Agent: 论文撰写大部分内容用一个节点进行撰写。
+- 问题：①生成的论文结构不稳定，②内容不充实且质量低，③论文规范性检测难以实现，④反思机制的成本过大，且效果不明显。
+2. 代码Agent：代码撰写用一个节点完成。
+- 问题：①容易生成bug，②反思机制的成本过大，且迭代轮次多，③代码机制质量不高，运行结果不详实。
+## V2:
+1. 主Agent: 根据学科论文规范，预定义好论文架构，每部分单独由一个节点完成，且引入外部工具，增强某些部分Agent撰写的表现力。
+2. 代码Agent: 先规划编程步骤，再按步骤编程；加入代码差异分析和错误管理进行上下文的管理；优化JSON方式，由"提示词限制输出格式和输出区域+re正则匹配"模式变为"提示词限制输出格式+pydantic"模式，增强代码可读性。
+3. Human-in-loop：Agent给出建模数据需求后，interrupt空出充足时间以便用户准备数据集。
+4. 格式转换：细化提示词对输出格式的限制，更换Markdown->pdf格式转换工具，使得最后生成的pdf文档更规范。
+## V3: (ongo)
+1. 前端设计。
+2. 加入Time-Travel机制，以便断点重启或者认为修改state参数。
 
-*BlackBox.py*: 
-Sub-agent to create project, generate py code and execute the code to get the result.
-
-*Structure.py*: 
-The main agent to write a thesis.
-
-*mcp_config*: 
-Deploy the mcp service
-
-*config*: 
-LLM api keys
+# 五、输出示例
+**V1版本**: 人口规模与结构对GDP总量影响的简约基准估计：一项三变量静态截面回归研究.pdf<br>
+**V2版本**: 人口结构双维张力对人均GDP增长的影响：基于劳动供给潜力与老年抚养负担的面板实证分析.pdf
