@@ -14,6 +14,7 @@ from pydantic import Field, field_validator
 from sqlalchemy import TypeDecorator
 
 from CodeManager import CodeDiffManager, ErrorSummarizer, CodeSandbox
+from retry_utils import clean_json_response, retry_call, retry_json_parse, RetryPolicy
 
 from typing import TypedDict, Annotated, List, Optional, Dict, get_args
 from typing_extensions import TypedDict
@@ -75,26 +76,6 @@ def process(path):
     return ret
 
 
-def clean_json_response(text: str) -> str:
-    """
-    清理模型响应，移除代码块标记
-    """
-    # 移除 ```json 和 ``` 标记
-    cleaned = re.sub(r'```(?:json)?\n?|\n?```', '', text)
-
-    # 移除可能的多余空白字符
-    cleaned = cleaned.strip()
-
-    # 如果开头是 {，确保结尾是 }（处理可能的截断）
-    if cleaned.startswith('{') and not cleaned.endswith('}'):
-        # 尝试找到最后一个 }
-        last_brace = cleaned.rfind('}')
-        if last_brace != -1:
-            cleaned = cleaned[:last_brace + 1]
-
-    return cleaned
-
-
 class CodeAgentState(TypedDict):
     files: List[str] # 读取的文件路径
     step: int # 建模逻辑步骤数
@@ -142,6 +123,8 @@ class CodeGenerationAgent:
         # 初始化 代码管理器 和 报错管理器
         self.codeManager = CodeDiffManager()
         self.errorManager = ErrorSummarizer()
+        # 重试管理器
+        self.retry_policy = RetryPolicy(max_attempts=3)
 
     def _build_graph(self):
         workflow = StateGraph(CodeAgentState)
@@ -165,6 +148,7 @@ class CodeGenerationAgent:
             {
                 "success": "evaluate_result",
                 "debug": "debug_and_fix",
+                "continue": "execute_code",
                 "max_iterations": END,
             }
         )
@@ -182,8 +166,20 @@ class CodeGenerationAgent:
 
     def should_debug(self, state: CodeAgentState) -> str:
         """决定是否需要调试"""
-        if state.get("iteration_count", 0) >= state.get("max_iterations", 5):
-            return "max_iterations"
+        if state.get("iteration_count", 0) >= state.get("max_iterations", 3):
+            # 等待用户手动debug
+            step = state['step']
+            src_path = os.path.join(str(self.project_dir), 'src', f'{step}main.py')
+            cont = interrupt(
+                f"步骤{step}debug失败，请手动debug。路径为'{src_path}'。\n建模逻辑为:\n{state['modeling_logic']}\n是否debug完成(Yes/No):"
+            )
+            if cont.lower() == 'yes':
+                # debug完成，重新复制当前state代码，并去execute
+                with open(src_path, "r", encoding="utf-8") as f:
+                    state["current_code"] = f.read()
+                return "continue"
+            else:
+                return "max_iterations"
         return state['state']
 
     def should_continue(self, state: CodeAgentState) -> str:
@@ -251,6 +247,7 @@ class CodeGenerationAgent:
         4. 每个属性后必须有逗号（除了最后一个）
         5. 布尔值必须是 true 或 false（小写）
         6. 中文字符可以直接使用，但特殊字符需要转义
+        7. main.py中的说有双引号必须用\\转义，避免后续转JSON格式失败
         
         *返回格式*
         JSON是最外层且唯一的输出。
@@ -293,10 +290,9 @@ class CodeGenerationAgent:
                         raise ValueError('格式错误: python文件格式有误，以标点符号起始，预期以import/from起始')
                 return p
 
-        raw_response = self.llm.invoke(prompts)
-        raw_content = raw_response.content
-        cleaned_content = clean_json_response(raw_content)  # 清理响应
-        data = json.loads(cleaned_content)
+        def _make_text() -> str:
+            return retry_call(lambda: self.llm.invoke(prompts).content, policy=self.retry_policy)
+        data = retry_json_parse(_make_text, policy=self.retry_policy, cleaner=clean_json_response)
         response = Code(**data)
 
         return {
@@ -420,6 +416,7 @@ class CodeGenerationAgent:
         4. 每个属性后必须有逗号（除了最后一个）
         5. 布尔值必须是 true 或 false（小写）
         6. 中文字符可以直接使用，但特殊字符需要转义
+        7. main.py中的说有双引号必须用\\转义，避免后续转JSON格式失败
         
         *返回格式*
         JSON是最外层且唯一的输出。
@@ -464,10 +461,9 @@ class CodeGenerationAgent:
                         raise ValueError('格式错误: python文件格式有误，以标点符号起始，预期以import/from起始')
                 return p
 
-        raw_response = self.llm.invoke(prompts)
-        raw_content = raw_response.content
-        cleaned_content = clean_json_response(raw_content)  # 清理响应
-        data = json.loads(cleaned_content)
+        def _make_text() -> str:
+            return retry_call(lambda: self.llm.invoke(prompts).content, policy=self.retry_policy)
+        data = retry_json_parse(_make_text, policy=self.retry_policy, cleaner=clean_json_response)
         response = Code(**data)
 
         return {
@@ -533,10 +529,9 @@ class CodeGenerationAgent:
             path: List[str] = Field(description='代码中保存csv文件名(若存在),放在列表里', default=[])
             reason: str = Field(description='你的判断理由', default="")
 
-        raw_response = self.llm.invoke(prompts)
-        raw_content = raw_response.content
-        cleaned_content = clean_json_response(raw_content) # 清理响应
-        data = json.loads(cleaned_content)
+        def _make_text() -> str:
+            return retry_call(lambda: self.llm.invoke(prompts).content, policy=self.retry_policy)
+        data = retry_json_parse(_make_text, policy=self.retry_policy, cleaner=clean_json_response)
         response = Reason(**data)
 
         print(f'生成文件: {paths}')
@@ -554,7 +549,7 @@ class CodeGenerationAgent:
             thread_id: str,
             modeling_logic: str,
             step: int,
-            max_iterations: int = 5,
+            max_iterations: int = 3,
     ):
         """运行图并处理用户交互"""
         initial_state = {
@@ -574,14 +569,16 @@ class CodeGenerationAgent:
                 initial_state,
                 config,
         ):
-            # print(trunk)
-            # 检查是否有中断，有则调用函数输入参数
-            # if "__interrupt__" in trunk:
-            #     cmd = self.parameter_input()
-            #     if cmd:
-            #         for resume_trunk in self.graph.stream(cmd, config):
-            #             # print(resume_trunk)
-            #             continue
+            if "__interrupt__" in trunk:
+                # 获取interrupt提示语
+                interrupt_obj = trunk["__interrupt__"][0]
+                prompt = interrupt_obj.value
+                # Command指令
+                cmd = self.parameter_input(prompt)
+                if cmd:
+                    for resume_trunk in self.graph.stream(cmd, config):
+                        # print(resume_trunk)
+                        continue
             continue
 
         # 返回最终代码执行结果
@@ -593,10 +590,10 @@ class CodeGenerationAgent:
             return ("未返回任何结果。", "未返回任何结果。")
 
 
-    def parameter_input(self):
+    def parameter_input(self, prompt):
         '''定义: Command函数根据需求传入函数参数'''
         # parameter_schema = self.graph.get_state(config).values.get("parameter_schema", {})
-        response = input(f'是否准备好数据(Yes/No)(路径为{self.project_dir/"data"}):')
+        response = input(prompt)
         response = response.strip().title()
         return Command(resume=response)
 
@@ -767,7 +764,11 @@ class CodeAgent:
             # print(trunk)
             # 检查是否有中断，有则调用函数输入参数
             if "__interrupt__" in trunk:
-                cmd = self.parameter_input()
+                # 获取interrupt提示语
+                interrupt_obj = trunk["__interrupt__"][0]
+                prompt = interrupt_obj.value
+                # Command指令
+                cmd = self.parameter_input(prompt)
                 if cmd:
                     for resume_trunk in self.graph.stream(cmd, config):
                         # print(resume_trunk)
@@ -781,17 +782,17 @@ class CodeAgent:
         modeling_steps = state.get("modeling_steps", []) # 建模详细步骤
         return {"outcome": outcome, "init_files": init_files, "modeling_steps": modeling_steps}
 
-    def parameter_input(self):
+    def parameter_input(self, prompt):
         '''定义: Command函数根据需求传入函数参数'''
         # parameter_schema = self.graph.get_state(config).values.get("parameter_schema", {})
-        response = input(f'是否准备好数据(Yes/No)(路径为{self.project_dir/"data"}):')
+        response = input(prompt)
         response = response.strip().title()
         return Command(resume=response)
 
 
 
 
-# if __name__ == '__main__':
+if __name__ == '__main__':
 #     from langchain_openai import ChatOpenAI
 #     API_KEY = ''
 #     # 使用langchain创建访问OpenAI的Model。
@@ -804,11 +805,13 @@ class CodeAgent:
 #     )
 #     agent = CodeAgent(model, "Finance")
 #     result = agent.run_with_user_interaction(
-#         "使用最小二乘法对数据建模，探寻GDP与人口的关系。首先对population进行正态性检验和标准化，去除空值等预处理操作。然后，建立对ggp和population建立线性模型。最后，对拟合效果进行分析，如R2、残差、残差正态性检验等。",
+#         "探究”人口结构双重压力下劳动供给与老龄化对人均GDP增长的非线性影响及区域异质性研究“，使用最小二乘法对数据建模，需要涉及异质性研究等",
 #         [
 #             {"name": 'year', 'type': 'int', "describe": '样本年份'},
-#             {"name": 'gdp', 'type': 'float', "describe": '当年国家的gdp'},
-#             {"name": 'population', 'type': 'int', "describe": '当年国家的人口数量'},
+#             {"name": 'gdp_per_capita', 'type': 'float', "describe": '当年国家的人均GDP'},
+#             {"name": 'labor_ratio', 'type': 'float', "describe": '劳动年龄人口占总人口比重，定义为15-59岁人口数量除以总人口数量，反映潜在劳动力供给规模。'},
+#             {"name": 'province_id', 'type': 'str', 'describe': '省级行政区划代码，用于识别观测单元，支撑固定效应估计与空间分组分析'},
+#             {"name": 'old_dependency_ratio', 'type': 'float', 'describe': '老年抚养比，定义为65岁及以上人口数量除以15-59岁人口数量，表征老龄化压力对财政与家庭资源的挤出效应。'},
 #         ],
 #         '1',
 #     )
