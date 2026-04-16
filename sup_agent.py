@@ -28,7 +28,7 @@ from Thesis.BlackBox import CodeAgent, clean_json_response
 from ThesisAgent.BlackBox import CodeGenerationAgent
 from Model import chat_model, code_model, parser
 from retry_utils import retry_call, retry_json_parse, RetryPolicy
-from cursor_skill_loader import build_keyword_messages
+from skill_loader import build_keyword_messages
 
 warnings.filterwarnings('ignore')
 
