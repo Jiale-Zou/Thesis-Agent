@@ -24,8 +24,11 @@
 │   └── 报错分析类<br>
 ├── Model.py                # LLM接口封装<br>
 ├── sup_agent.py            # 论文Agent（主Agent）<br>
+├── retry_utils.py          # LLM重试机制（最大重试次数为3）
+├── skill_loader.py         # skills加载
 ├── mcp_config.json         # MCP服务配置<br>
-└── config.json             # 项目运行参数配置<br>
+├── config.json             # 项目运行参数配置<br>
+└── skills/                 # SKILLS文件夹，可自由拓展，并在节点中设计
 
 # 二、前置工具要求
 在运行本项目前，请确保已安装以下工具：
@@ -36,7 +39,7 @@
 - mcp服务目录部署
 
 # 三、运行依赖库
-langchain, langgraph, pypandoc
+langchain, langgraph, pypandoc, sqlite
 # 四、迭代
 ## V1:
 1. *主Agent*: 论文撰写大部分内容用一个节点进行撰写。
@@ -48,9 +51,12 @@ langchain, langgraph, pypandoc
 2. *代码Agent*: 先规划编程步骤，再按步骤编程；加入代码差异分析和错误管理进行上下文的管理；优化JSON方式，由"提示词限制输出格式和输出区域+re正则匹配"模式变为"提示词限制输出格式+pydantic"模式，增强代码可读性。
 3. *Human-in-loop*：Agent给出建模数据需求后，interrupt空出充足时间以便用户准备数据集。
 4. *格式转换*：细化提示词对输出格式的限制，更换Markdown->pdf格式转换工具，使得最后生成的pdf文档更规范。
-## V3: (ongo)
-1. 前端设计。
-2. 加入Time-Travel机制，以便断点重启或者人为修改state参数。
+## V3(机制完善): 
+1. 加入重试机制，最大重试次数为3，提高对LLM API连接不稳定以及输出格式错误的容错
+2. 加入Time-Travel机制，使用Sqlite持久化记录。持断点重启、修改中间状态、历史快照查询
+3. 将Prompts整理为Skills，便于管理和拓展。
+## V4（ongo）: 
+1. 可视化页面。
 
 # 五、输出示例
 **V1版本**: 人口规模与结构对GDP总量影响的简约基准估计：一项三变量静态截面回归研究.pdf<br>
