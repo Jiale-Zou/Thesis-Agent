@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 import warnings
+from pathlib import Path
 
 import pandas as pd
 import pypandoc
@@ -26,8 +27,15 @@ from langgraph.prebuilt import create_react_agent
 from Thesis.BlackBox import CodeAgent, clean_json_response
 from ThesisAgent.BlackBox import CodeGenerationAgent
 from Model import chat_model, code_model, parser
+from retry_utils import retry_call, retry_json_parse, RetryPolicy
+from cursor_skill_loader import build_keyword_messages
 
 warnings.filterwarnings('ignore')
+
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
+except Exception:
+    SqliteSaver = None
 
 ''' 论文写作Agent
 工作流：规划 → 检索 → 解析 → 开题报告 → 撰写 → 评审
@@ -85,9 +93,6 @@ def get_description(paths: List[str]) -> str:
     ret_tables = '\n\n'.join(ret_tables)
 
     return ret_tables
-
-
-
 
 
 class PaperWritingState(TypedDict):
@@ -148,9 +153,38 @@ class SupAgent:
         self.PATH = config['workbase'] # 工作目录
         self.project_name = config['project_name'] # 项目名称
         self.project_dir = os.path.join(self.PATH, self.project_name)
-        self.wkhtmltopdf_path = config["wkhtmltopdf_path"] # wkhtmltopdf路径
-        self.checkpointer = MemorySaver()
+        self.checkpointer = self._build_checkpointer(config)
+        self.retry_policy = RetryPolicy(max_attempts=3) # 最大三次重试
         self.graph = self._build_graph()
+
+    def _build_checkpointer(self, config: Dict[str, Any]):
+        """
+        Time-Travel 需要持久化检查点；优先 SqliteSaver，失败时回退 MemorySaver。
+        """
+        db_path = config.get("checkpoint_db", "")
+        if not db_path:
+            db_path = str((Path(self.project_dir) / "logs" / "agent.sqlite").resolve())
+        try:
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        if SqliteSaver is not None:
+            try:
+                saver = SqliteSaver.from_conn_string(db_path)
+                return saver
+            except Exception as e:
+                print(f"[warn] SqliteSaver初始化失败，回退到MemorySaver: {e}")
+        else:
+            print("[warn] 当前环境无SqliteSaver，回退到MemorySaver。")
+        return MemorySaver()
+
+    def _mk_config(self, thread_id: str, checkpoint_id: Optional[str] = None) -> Dict[str, Any]:
+        '''构造config'''
+        configurable = {"thread_id": thread_id}
+        if checkpoint_id:
+            configurable["checkpoint_id"] = checkpoint_id
+        return {"configurable": configurable}
 
     def _build_graph(self):
         workflow = StateGraph(PaperWritingState)
@@ -165,7 +199,6 @@ class SupAgent:
         workflow.add_node('thing_write_node', self.thing_write_node)
         workflow.add_node('indicator_write_node', self.indicator_write_node)
         workflow.add_node('method_write_node', self.method_write_node)
-        workflow.add_node('method_write_check_node', self.method_write_check_node)
         workflow.add_node('chart_extract_node', self.chart_extract_node)
         workflow.add_node('result_write_node', self.result_write_node)
         workflow.add_node('introduction_conclusion_write_node', self.introduction_conclusion_write_node)
@@ -190,15 +223,14 @@ class SupAgent:
         workflow.add_edge('code_node', 'thing_write_node')
         workflow.add_edge('thing_write_node', 'indicator_write_node')
         workflow.add_edge('indicator_write_node', 'method_write_node')
-        workflow.add_edge('method_write_node', 'method_write_check_node')
-        workflow.add_edge('method_write_check_node', 'chart_extract_node')
+        workflow.add_edge('method_write_node', 'chart_extract_node')
         workflow.add_edge('chart_extract_node', 'result_write_node')
         workflow.add_edge('result_write_node', 'introduction_conclusion_write_node')
         workflow.add_edge('introduction_conclusion_write_node', 'reference_node')
         workflow.add_edge('reference_node', 'assemble_node')
         workflow.add_edge('assemble_node', 'format_node')
         # 编译图
-        return workflow.compile(checkpointer=self.checkpointer)
+        return workflow.compile(checkpointer=self.checkpointer.__enter__()) # 为保证SqliteSaver生命周期与graph一压样，前面返回连接，这里传入实例.__enter__()
 
 
     def _literature_check_route(self, state: PaperWritingState):
@@ -208,33 +240,16 @@ class SupAgent:
     def keyword_node(self, state: PaperWritingState):
         print(">>> 关键字节点")
 
-        prompt = '''
-        你是一个经济管理领域的论文写作专家。
-
-        *任务*
-        根据用户的要求，生成该论文有关的'检索关键词'，要求全面涵盖主题，最多为4个。
-
-        *分析示例*
-        **用户输入**: "我要写一篇有关ESG与股票风险关系的论文，具体来说，需要先采用某种风险测度衡量股票风险，然后选取某些指标来衡量股票ESG水平，最后再实证ESG水平与股票风险测度的关系。"
-        **分析过程**:
-            1. **明确主题**: 用户的主题为'ESG与股票风险'，其中涉及到两个关键字'ESG'和'股票分析'。
-            2. **分析用户具体要求**: 用户提出了具体的要求，即分为三方面考虑，一是定义'风险测度'来衡量股票风险，二是选取指标衡量'ESG水平'，三是研究'相关关系'。
-            3. **确定文章检索的关键字**: 根据对用户意图的分析，找到有关的的关键字为'ESG评分'、'ESG指标'、'股票风险测度'、'VaR'、'ES'、'相关性研究'、'因果关系'等。
-        
-        *返回结果*
-        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
-        {"keyword": ["检索关键词"]}
-        '''
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': state['user_input']},
-        ]
+        prompts = build_keyword_messages(
+            'paper-keyword',
+            user_input=f'## 用户要求\n{state["user_input"]}'
+        )
 
         class KeyWord(BaseModel):
             keyword: List[str] = Field(description='检索关键词')
 
         structured_model = self.chat.with_structured_output(KeyWord)
-        response = structured_model.invoke(prompts)
+        response = retry_call(lambda: structured_model.invoke(prompts), policy=self.retry_policy)
 
         print(f'plan_step: 检索关键词为{response.keyword[:4]}')
 
@@ -303,12 +318,17 @@ class SupAgent:
         search_google_scholar_key_words = [tool for tool in tools if tool.name == 'search_google_scholar_key_words'][0]
         query_result = []
         for query in queries:
-            resp = asyncio.run(search_google_scholar_key_words.ainvoke(
-                {
-                    'query': query,
-                    'num_results': 10
-                }
-            ))
+            resp = retry_call(
+                lambda: asyncio.run(
+                    search_google_scholar_key_words.ainvoke(
+                        {
+                            'query': query,
+                            'num_results': 10
+                        }
+                    )
+                ),
+                policy=self.retry_policy,
+            )
             query_result.extend(query_parse(resp))
         print(f'search_step: 共{len(query_result)}篇文献')
         print(query_result)
@@ -330,53 +350,23 @@ class SupAgent:
         supply_prompt = ''
         if state['next_node'] == 'literature':
             supply_prompt = f'''
-            *文献综述初稿*
+            ## 文献综述初稿
             {state['literature_review']}
-            *初稿不合规*
+            ## 初稿不合规
             {state['literature_review_check']}
             '''
 
-
-        prompt = f'''
-        你是一个论文阅读分析专家。
-
-        *任务*
-        '根据*用户写作要求*和给定的*参考文献*信息，{'写出文献综述' if state['next_node']=='literature' else '参照*初稿不合规*，修改*参考文献*'}。
-            - **只能使用给定的参考文献，不能捏造或使用未给定的参考文献**
-            - **字数限制在3000-4000之间**
-            - 严格遵守*注意事项*
-            
-        *参考文献*
-        {str_papers_meta}
-        
-        *用户写作要求*
-        {state["user_input"]}
-        
-        {supply_prompt}
-        
-        *注意事项*
-        1. 引用参考文献中中的观点，必须在句末严格按照"(author, year)"的形式标注出来，且author必须按照参考文献中给定的author写法展示。
-            - 给定参考文献: 【文献1】标题:人工只能在教育中的应用 | 作者:Jack & John & Kimi | 年份:2020 | 摘要:本文结合当今热点，详细论述了人工智能时代下教育的改革方向为智教结合...
-            - 正确示范: John(2020)通过研究发现，人工智能时代的教育新方向为智教结合(Jack & John & Kimi, 2020)
-            - 错误示范: ....(Jack, 2020) <- 遗漏
-            - 错误示范: ....(Jack & john, 2020) <- 遗漏
-            - 错误示范: ....(Jack et al., 2020) <- 参考文献为'Jack & John & Kimi'，但这里写为'Jack et al.'
-            - 错误示范: ....(Jack, john & Kimi, 2020) <- 参考文献为'Jack & John & Kimi'，但这里写为'Jack, john & Kimi'
-        2. 可分段撰写（分主题综述：理论/实证/缺口），正文段首用"&emsp;&emsp;"实现首行缩减，段尾用两个空字符"\\n\\n"实现换行
-            
-        *返回结果*
-        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
-        {{"literature": "符合格式要求，且字数为3000-4000之间的文献综述"}}
-        '''
-        prompts = [
-                {'role': 'user', 'content': prompt}
-            ]
+        prompts = build_keyword_messages(
+            'literature-review',
+            render={'task': '写出文献综述' if state['next_node']=='literature' else '参照*初稿不合规*，修改*参考文献*'},
+            user_input=f'## 参考文献\n{str_papers_meta}\n## 用户写作要求\n{state["user_input"]}\n{supply_prompt}'
+        )
 
         class Literature(BaseModel):
             literature: str = Field(description='符合格式要求，且字数为3000-4000之间的文献综述')
 
         structured_model = self.chat.with_structured_output(Literature)
-        response = structured_model.invoke(prompts)
+        response = retry_call(lambda: structured_model.invoke(prompts), policy=self.retry_policy)
         print(f'文献综述:\n{response.literature}')
 
         return {'literature_review': response.literature, 'next_node': 'literature_check', 'review_iteration': state.get('review_iteration',0)+1}
@@ -419,28 +409,15 @@ class SupAgent:
     def plan_node(self, state: PaperWritingState):
         print("\n>>> 规划节点")
 
-        prompt = '''
-        你是一个经济管理领域的论文写作专家。
+        prompts = build_keyword_messages(
+            'plan-thesis',
 
-        *任务*
-        给定*用户要求*, *文献综述*，生成论文的题目和研究方法。
-        
-        *要求*
-        1. 研究主题(theme): 参照*文献综述*中以往学者的研究成果和*用户要求*，考虑到创新性和可行性，确定论文的题目。
-        2. 研究数据(data): 明确描述研究该主题所需用到的全部数据字段，包含字段名称、字段类型、字段描述三部分。请注意，只要在后续编程过程中可能会涉及到的字段，都需要说明，包括一些辅助字段(时间、标识、过滤、聚合等)，比如'年份', 'id'等等。使用的数据字段不超过5个。
-        3. 研究方法(method): 对于step1的研究主题和step2的研究数据，选取合适的方法对其进行建模，详细地描述建模过程。
-            - 只能使用'data'中定义的字段名。
-            - 若需要使用'data'中的字段衍生出的其他字段名（如log, exp变换），需要明确交代该衍生字段与原始字段的计算关系式。
-            - 不能涉及到对研究数据的数量、质量、时间的要求。
-        
-        *返回结果*
-        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
-        {"theme": "论文题目", "method": "研究方法", "data": [{"name": "字段名称，用英文表示", "type": ""字段类型，如int,str,float等}, "description": "字段描述，对字段的含义进行说明"]}
-        '''
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': f'*用户要求*: "{state["user_input"]}"。*文献综述*: "{state["literature_review"]}"'},
-        ]
+        )
+
+        prompts = build_keyword_messages(
+            'plan-thesis',
+            user_input=f'## 用户要求\n"{state["user_input"]}"\n\n## 文献综述\n{state["literature_review"]}'
+        )
 
         class Data(BaseModel):
             name: str = Field('字段名称，用英文表示')
@@ -453,7 +430,7 @@ class SupAgent:
             method: str = Field('研究方法')
 
         structured_model = self.chat.with_structured_output(Structure)
-        response = structured_model.invoke(prompts)
+        response = retry_call(lambda: structured_model.invoke(prompts), policy=self.retry_policy)
 
         data_str = []
         for d in response.data:
@@ -481,31 +458,10 @@ class SupAgent:
             )
         data_str = '\n'.join(data_str)
 
-        prompt = '''
-        你是一个数学建模的规划专家。
-
-        *任务*
-        给定*研究方法*, *数据字段*，判断*数据字段*和*研究方法*是否满足数据要求。
-
-        *重点关注*
-        - *研究方法*中使用的数据字段是否在*数据字段*中，或者可由*数据字段*计算变换得到。
-        - *研究方法*中可能隐含了数据处理和建模中所需的辅助字段(比如时间,编号,组别)，请从编程和建模的角度考虑这些必须的字段，以免实际编程时缺失。
-        - 后续编程使用的工具为Python，需估计*研究方法*是否可行。若不可行，需简化为一种可行的研究方法。
-        - 研究数据(data)是否不超过5个
-        
-        *输出*
-        是否合规(valid): Yes/No(Yes表示数据字段和研究方法满足数据要求)
-        研究数据(data): (valid为Yes时为空)满足要求的数据字段，明确描述研究该主题所需用到的全部数据字段，包含字段名称、字段类型、字段描述三部分
-        研究方法(method): (valid为Yes时为空)满足要求的研究方法
-        
-        *返回结果*
-        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
-        {"theme": "论文题目", "method": "研究方法", "data": [{"name": "字段名称，用英文表示", "type": ""字段类型，如int,str,float等}, "description": "字段描述，对字段的含义进行说明"]}
-        '''
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': f'*研究方法*\n"{state["method"]}"\n*数据字段*\n"{data_str}"。请按要求进行判断'},
-        ]
+        prompts = build_keyword_messages(
+            'plan-thesis-check',
+            user_input=f'## 研究方法\n"{state["method"]}"\n\n## 数据字段\n{data_str}。请按要求进行判断'
+        )
 
         class Data(BaseModel):
             name: str = Field('字段名称，用英文表示')
@@ -518,7 +474,7 @@ class SupAgent:
             method: str = Field('研究方法')
 
         structured_model = self.chat.with_structured_output(Structure)
-        response = structured_model.invoke(prompts)
+        response = retry_call(lambda: structured_model.invoke(prompts), policy=self.retry_policy)
 
         if response.valid.lower() == "yes":
             return {'next_node': 'code'}
@@ -543,7 +499,7 @@ class SupAgent:
         data_dict = []
         for d in data:
             data_dict.append(
-                {'name': d.name, 'type': d.type, 'describe': d.description}
+                {'name': d['name'], 'type': d['type'], 'describe': d['description']}
             )
 
         agent = CodeAgent(self.code, self.project_name)
@@ -578,25 +534,13 @@ class SupAgent:
             )
         method_detail = '\n'.join(method_detail)
         # LLM交互
-        prompt = f'''
-        *研究方法*
-        {method_detail}
-        
-        *任务*
-        给定*研究任务*，你需要将其抽取为几个主题。主题需要使用经管、统计领域的专业名词进行概括（每个主题不超过10个字）。
-        示例: 基准回归分析，非线性效应检验，稳健性检验
-        
-        *返回结果*
-        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
-        ["抽取的主题，每个主题不超过10个字"]
-        '''
-        prompts = [
-            {'role': 'system', 'content': prompt},
-        ]
-        raw_response = self.chat.invoke(prompts)
-        raw_content = raw_response.content
-        cleaned_content = clean_json_response(raw_content)  # 清理响应
-        data = json.loads(cleaned_content)
+        prompts = build_keyword_messages(
+            'study-step',
+            user_input=f'## 研究方法\n{method_detail}'
+        )
+        def _make_text() -> str:
+            return retry_call(lambda: self.chat.invoke(prompts).content, policy=self.retry_policy)
+        data = retry_json_parse(_make_text, policy=self.retry_policy, cleaner=clean_json_response)
         # 生成行文大纲图片
         def generate_mermaid_png(study_node, output_file='diagram.png'):
             """
@@ -667,7 +611,7 @@ class SupAgent:
     def indicator_write_node(self, state: PaperWritingState):
         print("\n>>> 数据指标撰写节点")
 
-        method = state['method']
+        # method = state['method']
         data = state["data"]
         data_str = []
         for d in data:
@@ -676,42 +620,11 @@ class SupAgent:
             )
         data_str = '\n'.join(data_str)
         init_files = state["code_result"]["init_files"]
-        prompt = f'''
-        你是一个论文写作专家，现在你正在撰写论文的指标说明部分。
-        
-        *背景说明*
-        给定的*数据说明*表示数据字段的含义，这些数据字段将被用于*研究方法*的实施。你需要以给定Mardown的格式撰写指标说明，字数为2000-2500。
-        
-        *数据文件路径*
-        {init_files}
-        *数据说明*
-        {data_str}
-        *研究方法*
-        {method}
-        
-        *撰写格式*
-        - ### 作为小标题标志
-        - 用1/2/3...作为小标题序号
-        - 不用包含”指标说明“大标题
-        - 正文段首用"&emsp;&emsp;"实现首行缩减，段尾用"\\n\\n"实现换行
-        - 不要使用**给正文加斜体
-        - 示例:
-        ### 1. 指标定义
-        对研究中涉及的核心指标进行定义、解释、来源说明，使用“无序列表分条列点”说明。
-        ### 2. 指标描述性统计
-        对核心数据字段进行描述性统计，必须以“表格+文字”的形式展示，表格格式为：
-        | 变量 | count | mean | std | min | max | nunique |
-        ### 3. 指标合理性说明
-        对指标选取的合理性和适用性进行说明。
-        
-        *输出要求*
-        请严格按照*撰写格式*输出对应的Markdown格式，不要包含任何其他文本、解释或额外的格式。
-        '''
 
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': '请严格按照要求生成Markdown格式的指标说明文本。'}
-        ]
+        prompts = build_keyword_messages(
+            'indicator-write',
+            user_input=f'## 数据文件路径\n{init_files}\n\n## 数据说明\n{data_str}'
+        )
 
         agent = create_react_agent(
             model = self.chat,
@@ -744,94 +657,13 @@ class SupAgent:
                 f'- 步骤{map[i]}: {step}'
             )
         method_detail = '\n'.join(method_detail)
-        prompt = f'''
-        你是一个论文写作专家，现在你正在撰写论文的方法说明部分。
 
-        *背景说明*
-        给定的研究方法和研究方法的详细执行步骤，你需要以给定Mardown的格式撰写方法说明，字数为2500-3500字。
-        *研究方法*
-        {method}
-        *研究方法详细步骤*
-        {method_detail}
-        
-        *数学公式格式*
-        1. 行内公式: $公式内容$
-        2. 独立公式: $$公式内容$$
-        3. 上下标: x^2, a_n, x^{{n+m}}
-        4. 分式: \\frac{{a}}{{b}}
-        5. 根号: \sqrt{{x}}, \sqrt[n]{{x}}
-        6. 希腊字母: \\alpha, \\beta, \Omega, \pi
-        7. 求和/积分: \sum_{{i=1}}^n, \int_a^b
-        8. 矩阵: \\begin{{matrix}} 1 & 2 \\\\ 3 & 4 \end{{matrix}}
-        9. 独立公式换行: \\begin{{aligned}} 公式 \\end{{aligned}}，公式内用在行尾用\\\\换行
+        prompts = build_keyword_messages(
+            'method-write',
+            user_input=f'## 研究方法\n{method}\n\n## 研究方法详细步骤\n{method_detail}'
+        )
 
-        *撰写格式*
-        - ### 作为小标题标志
-        - 用1/2/3...作为小标题序号
-        - 不用包含”方法说明“大标题
-        - 对于每一小标题的明细内容，可使用无序编号(*)分条列点
-        - 正文段首用"&emsp;&emsp;"实现首行缩减，段尾用两个空字符"\\n\\n"实现换行
-        - 可适当插入公式进行说明，公式的格式需严格遵守*数学公式格式*。若公式过长，需对公式换行避免溢出
-        - 不要使用**给正文加斜体
-        - 示例:
-        ### 1. 研究方法选择
-        阐述研究所采用的主要方法及其适用性。
-        ### 2. 模型构建
-        详细描述理论模型或分析框架的构建过程。
-        ### 3. 数据处理与分析技术
-        说明数据收集、清洗、处理及分析的具体技术方法。
-
-        *输出要求*
-        请严格按照*撰写格式*输出对应的Markdown格式，不要包含任何其他文本、解释或额外的格式。
-        '''
-
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': '请严格按照要求生成Markdown格式的方法说明文本。'},
-        ]
-
-        response = self.chat.invoke(prompts).content
-        return {"method_part": response}
-
-    def method_write_check_node(self, state: PaperWritingState):
-        print("\n>>> 公式检查节点")
-        prompt = f'''
-        你是一个Markdown公式检查专家。
-        
-        *任务*
-        对传入markdown文本，**不改变其内容和格式**，只检查和更正其公式的正确性，返回更正后的文本。
-        
-        *传入markdown文本*
-        {state["method_part"]}
-        
-        *数学公式格式*
-        1. 行内公式: $公式内容$
-        2. 独立公式: $$公式内容$$
-        3. 上下标: x^2, a_n, x^{{n+m}}
-        4. 分式: \\frac{{a}}{{b}}
-        5. 根号: \sqrt{{x}}, \sqrt[n]{{x}}
-        6. 希腊字母: \\alpha, \\beta, \Omega, \pi
-        7. 求和/积分: \sum_{{i=1}}^n, \int_a^b
-        8. 矩阵: \\begin{{matrix}} 1 & 2 \\\\ 3 & 4 \end{{matrix}}
-        9. 独立公式换行: \\begin{{aligned}} 公式 \\end{{aligned}}，公式内用在行尾用\\\\换行
-        
-        *markdown格式*
-        - ### 作为小标题标志
-        - 用1/2/3...作为小标题序号
-        - 对于每一小标题的明细内容，可使用无序编号(*)分条列点
-        - 正文段首用"&emsp;&emsp;"实现首行缩减，段尾用两个空字符"\\n\\n"实现换行
-        - 公式的格式需严格遵守*数学公式格式*
-        - 不要使用**给正文加斜体
-        
-        输出要求*
-        请严格按照*markdown格式*输出对应的Markdown格式，不要包含任何其他文本、解释或额外的格式。
-        '''
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': '请严格按照要求生成Markdown格式的文本，不要更改原文本的内容和结构。'},
-        ]
-
-        response = self.chat.invoke(prompts).content
+        response = retry_call(lambda: self.chat.invoke(prompts).content, policy=self.retry_policy)
         return {"method_part": response}
 
     def chart_extract_node(self, state: PaperWritingState):
@@ -856,38 +688,19 @@ class SupAgent:
                 f'- 步骤{map[i]}: {oc}'
             )
         outcome_str = '\n'.join(outcome_str)
-        prompt = f'''
-        你是一个实验结果信息分析专家。
-
-        *任务*
-        给定*实验结果*，你需要重中抽取可以表格形式展示的数据，并以Markdown表格的形输出。
-
-        *实验结果*
-        {outcome_str}
-        
-        *抽取格式*
-        包含两部分
-        - 表格说明: 指出这是第几步、进行什么处理后生成的结果
-        - 表格: Markdown表格的形式抽取数据（形式如"| text | text | text |"）
-
-        输出要求*
-        JSON是最外层且唯一的输出。
-        你必须只返回一个有效的 JSON 对象，不要包含任何其他文本、Markdown 代码块、解释或额外的格式，格式如下:
-        {{"charts": [{{"describe": "表格说明", "chart": "Markdown格式的表格"}}]}}
-        '''
-        prompts = [
-            {'role': 'system', 'content': prompt},
-        ]
+        prompts = build_keyword_messages(
+            'chart-extract',
+            user_input=f'## 实验结果\n{outcome_str}'
+        )
         class Chart(BaseModel):
             describe: str = Field(description="表格说明")
             chart: str = Field(description="Markdown格式的表格")
         class ChartList(BaseModel):
             charts: List[Chart] = Field(description="以List形式存储提取到的全部表格")
 
-        raw_response = self.chat.invoke(prompts)
-        raw_content = raw_response.content
-        cleaned_content = clean_json_response(raw_content)  # 清理响应
-        data = json.loads(cleaned_content)
+        def _make_text() -> str:
+            return retry_call(lambda: self.chat.invoke(prompts).content, policy=self.retry_policy)
+        data = retry_json_parse(_make_text, policy=self.retry_policy, cleaner=clean_json_response)
         response = ChartList(**data)
 
         ret = []
@@ -943,97 +756,27 @@ class SupAgent:
         img_dir = os.path.join(str(self.project_dir), 'img')
         img_name = os.listdir(img_dir)
         img_path = '\n'.join([os.path.join(img_dir, name) for name in img_name if '.' in name])
-        prompt = f'''
-        你是一个论文写作专家，现在你正在撰写论文的实证研究部分。
-        *背景说明*
-        给定的*研究方法*和*实验结果*，你需要以给定Mardown的格式撰写实验结果，字数为4000-5000字。
-        
-        *研究主题*
-        {state["theme"]}
-        
-        *研究方法*
-        {method_detail}
-        
-        *实验结果*
-        {outcome_str}
-        
-        *表格*
-        以下可使用表格是从*实验结果*中抽取得到。
-        {charts}
-        
-        *撰写格式*
-        - ### 作为小标题标志
-        - 可拆分为几部分进行论述，用1/2/3...作为小标题序号
-        - 不用包含”实证研究“大标题
-        - 对于每一小标题的明细内容，可使用无序编号(*)分条列点
-        - 正文段首用"&emsp;&emsp;"实现首行缩减，段尾用两个空字符"\\n\\n"实现换行
-        - 可适当穿插图片，生成的可使用的图片路径见*图片路径*，图片引用格式见*图片引用格式*
-        - 除图片的注释说明外，不要使用**给正文加斜体
-        
-        *图片引用格式*
-        - 插入的图片得单独成段，因此上一段得在段尾使用两个空字符"\\n\\n"换行
-        - 图片得有注释
-        - 图片引用格式为 "![](图片路径)  "，注释格式为"&emsp;&emsp;*图: 图片注释*\\n\\n"，注意有末尾分别为"  "和"\\n\\n"
-        - 示例:
-        "![](D:\AiProgram\Thesis\Finance\img\描述性统计_箱线图.jpg)  &emsp;&emsp;*图: 各变量分布的箱线图，验证对数变换的有效性*\\n\\n"
-        
-        *撰写内容要求*
-        - 不能提及文件名，只能提及处理的字段名
-        - 除了文字说明外，还需要以表格的形式展示结果。可使用的表格见*表格*，若其数据与*实验结果*存在冲突，以*实验结果*为准
-        - 以专业学术的语言论述实验过程和结果，而不是仅仅对步骤进行描述
-        
-        *图片路径*
-        {img_path}
-        
-        *输出要求*
-        请严格按照*撰写格式*输出对应的Markdown格式，不要包含任何其他文本、解释或额外的格式。
-        '''
 
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': '请严格按照要求生成Markdown格式的方法说明文本。'},
-        ]
-
-        response = self.chat.invoke(prompts).content
+        prompts = build_keyword_messages(
+            'result-write',
+            user_input=f'## 研究主题\n{state["theme"]}\n\n## 研究方法\n{method_detail}\n\n## 实验结果\n{outcome_str}\n\n## 表格\n以下表格从实验结果中抽取得到。\n{charts}\n\n## 图片路径\n{img_path}'
+        )
+        response = retry_call(lambda: self.chat.invoke(prompts).content, policy=self.retry_policy)
         return {"result_part": response}
 
     def introduction_conclusion_write_node(self, state: PaperWritingState):
         print('\n>>> 引言、结论撰写节点')
-        prompt = f'''
-        你是一个论文写作专家，现在你正在撰写论文的引言部分和结论部分。
-        *背景说明*
-        给定论文的主题、文献综述和实验结果，写出论文的引言(1500-2000字)、结论和展望(1000-1500字)。
-        
-        *论文主题*
-        {state["theme"]}
-        *文献综述*
-        {state["literature_review"]}
-        *实验结果*
-        {state["result_part"]}
 
-
-        *撰写格式*
-        - ### 作为小标题标志
-        - 可拆分为几部分进行论述，用1/2/3...作为小标题序号
-        - 不用包含“引言”、“结论和展望”大标题
-        - 对于每一小标题的明细内容，可使用无序编号(*)分条列点
-        - 正文段首用"&emsp;&emsp;"实现首行缩减，段尾用两个空字符"\\n\\n"实现换行
-        - 不要使用**给正文加斜体
-
-        *输出要求*
-        引言(introduction)、结论和展望(conclusion)都需请严格按照*撰写格式*输出对应的Markdown格式，不要包含任何其他文本、解释或额外的格式。
-        最后以JSON格式分别存储引言、结论和展望: {{"introduction": "Markdown格式的引言", "conclusion": "Markdown格式的结论和展望"}}
-        '''
-        prompts = [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': '请严格按照*输出要求*的格式生成结果。'},
-        ]
+        prompts = build_keyword_messages(
+            'intro-conc-write',
+            user_input=f'## 论文主题\n{state["theme"]}\n\n## 实验结果\n{state["result_part"]}'
+        )
         class IC(BaseModel):
             introduction: str = Field(description='Markdown格式的引言')
             conclusion: str = Field(description='Markdown格式的结论和展望')
 
         structured_model = self.chat.with_structured_output(IC)
-        response = structured_model.invoke(prompts)
+        response = retry_call(lambda: structured_model.invoke(prompts), policy=self.retry_policy)
 
         return {"introduction_part": response.introduction, "conclusion_part": response.conclusion}
 
@@ -1150,39 +893,113 @@ class SupAgent:
 
         return {}
 
+    def get_current_state(self, thread_id: str, checkpoint_id: Optional[str] = None) -> Dict[str, Any]:
+        """读取当前/指定checkpoint的状态快照。"""
+        config = self._mk_config(thread_id, checkpoint_id)
+        state = self.graph.get_state(config)
+        return state.values
+
+    def list_state_history(self, thread_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        列出状态历史（用于选择checkpoint进行Time-Travel）。
+        """
+        config = self._mk_config(thread_id)
+        if not hasattr(self.graph, "get_state_history"):
+            raise RuntimeError("当前langgraph版本不支持 get_state_history。")
+
+        rows: List[Dict[str, Any]] = []
+        for i, item in enumerate(self.graph.get_state_history(config)):
+            if i >= limit:
+                break
+            rows.append(
+                {
+                    "index": i,
+                    "checkpoint_id": (item.config or {}).get("configurable", {}).get("checkpoint_id", ""),
+                    "next": list(item.next) if getattr(item, "next", None) else [],
+                    "values": item.values,
+                }
+            )
+        return rows
+
+    def patch_state(
+        self,
+        thread_id: str, # 线程ID
+        state_patch: Dict[str, Any], # 你要改的内容，Dict
+        checkpoint_id: Optional[str] = None, # 要修改哪个历史断点（不填=最新断点）
+        as_node: Optional[str] = None, # 内部用，永远不用传
+    ) -> Dict[str, Any]:
+        """
+        人工改 state：
+        - 可以在当前线程最新checkpoint改
+        - 也可以指定checkpoint_id后改
+        """
+        config = self._mk_config(thread_id, checkpoint_id)
+        kwargs = {}
+        if as_node:
+            kwargs["as_node"] = as_node
+        self.graph.update_state(config, state_patch, **kwargs)
+        return self.get_current_state(thread_id, checkpoint_id)
+
+    def resume_from_checkpoint(
+        self,
+        thread_id: str, # 线程ID
+        checkpoint_id: Optional[str] = None, # 可选: 从哪个断点继续（不填=最新）
+        state_patch: Optional[Dict[str, Any]] = None, # 可选: 恢复前先修改状态，再继续运行
+    ) -> Dict[str, Any]:
+        """
+        从断点恢复执行：
+        1) 可选切换到历史checkpoint
+        2) 可选先patch state
+        3) 从该状态继续stream
+        """
+        config = self._mk_config(thread_id, checkpoint_id)
+        if state_patch:
+            self.graph.update_state(config, state_patch)
+
+        for trunk in self.graph.stream(None, config):
+            continue
+        return self.graph.get_state(config).values
+
     def run_graph(
             self,
-            user_input: str,
-            thread_id: str,
-            max_review_iteration: int = 2,
+            user_input: Optional[str], # 你的需求（resume=True 时可不传）
+            thread_id: str, # 线程ID
+            max_review_iteration: int = 2, # 文献综述最大迭代次数
+            resume: bool = False, # True=从断点继续，False=从头跑
+            state_patch: Optional[Dict[str, Any]] = None, # 运行前先修改状态
+            checkpoint_id: Optional[str] = None,
     ):
-        """运行图并处理用户交互"""
-        initial_state = {
-            "user_input": user_input,
-            "max_review_iteration": max_review_iteration
-        }
-        config = {
-            'configurable': {
-                'thread_id': thread_id,
-            }
-        }
+        """运行图（支持断点重启 + 人工state修订）"""
+        config = self._mk_config(thread_id, checkpoint_id)
 
-        # 开始执行
+        if state_patch:
+            self.graph.update_state(config, state_patch)
+
+        if resume:
+            stream_input = None
+        else:
+            if not user_input:
+                raise ValueError("resume=False 时 user_input 不能为空。")
+            stream_input = {
+                "user_input": user_input,
+                "max_review_iteration": max_review_iteration
+            }
+
         for trunk in self.graph.stream(
-                initial_state,
+                stream_input,
                 config,
         ):
             continue
 
-        # 返回最终代码执行结果
         state = self.graph.get_state(config).values
-        return state["thesis"]
+        return state.get("thesis", "")
 
 if __name__ == '__main__':
     agent = SupAgent()
     result = agent.run_graph(
-        user_input =  "我想写一篇有关人口对GDP影响因数的论文。",
-        thread_id = '29819'
+        user_input =  None,#"我想写一篇有关人口对GDP影响因数的论文。",
+        thread_id = '29819',
+        resume = True,
     )
     print(result)
 
