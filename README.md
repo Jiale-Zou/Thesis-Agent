@@ -28,7 +28,7 @@
 ├── skill_loader.py         # skills加载
 ├── mcp_config.json         # MCP服务配置<br>
 ├── config.json             # 项目运行参数配置<br>
-└── skills/                 # SKILLS文件夹，可自由拓展，并在节点中设计
+└── skills/                 # SKILLS文件夹，可自由拓展，并在节点中设计<br>
 
 # 二、前置工具要求
 在运行本项目前，请确保已安装以下工具：
@@ -52,8 +52,8 @@ langchain, langgraph, pypandoc, sqlite
 3. *Human-in-loop*：Agent给出建模数据需求后，interrupt空出充足时间以便用户准备数据集。
 4. *格式转换*：细化提示词对输出格式的限制，更换Markdown->pdf格式转换工具，使得最后生成的pdf文档更规范。
 ## V3(机制完善): 
-1. 加入重试机制，最大重试次数为3，提高对LLM API连接不稳定以及输出格式错误的容错
-2. 加入Time-Travel机制，使用Sqlite持久化记录。持断点重启、修改中间状态、历史快照查询
+1. 加入重试机制，最大重试次数为3，提高对LLM API连接不稳定以及输出格式错误的容错。
+2. 加入Time-Travel机制，使用Sqlite持久化记录。支持断点重启、修改中间状态、历史快照查询。
 3. 将Prompts整理为Skills，便于管理和拓展。
 4. 针对模型debug能力的不足（没有更好的模型），加入Huam-in-loop干预，当模型debug失败3次后，可手动完成debug辅助程序运行。
 ## V4（ongo）: 
