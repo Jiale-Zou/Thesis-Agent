@@ -24,8 +24,8 @@
 │   └── 报错分析类<br>
 ├── Model.py                # LLM接口封装<br>
 ├── sup_agent.py            # 论文Agent（主Agent）<br>
-├── retry_utils.py          # LLM重试机制（最大重试次数为3）
-├── skill_loader.py         # skills加载
+├── retry_utils.py          # LLM重试机制（最大重试次数为3）<br>
+├── skill_loader.py         # skills加载<br>
 ├── mcp_config.json         # MCP服务配置<br>
 ├── config.json             # 项目运行参数配置<br>
 └── skills/                 # SKILLS文件夹，可自由拓展，并在节点中设计<br>
