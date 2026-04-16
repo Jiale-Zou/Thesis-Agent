@@ -55,6 +55,7 @@ langchain, langgraph, pypandoc, sqlite
 1. 加入重试机制，最大重试次数为3，提高对LLM API连接不稳定以及输出格式错误的容错
 2. 加入Time-Travel机制，使用Sqlite持久化记录。持断点重启、修改中间状态、历史快照查询
 3. 将Prompts整理为Skills，便于管理和拓展。
+4. 针对模型debug能力的不足（没有更好的模型），加入Huam-in-loop干预，当模型debug失败3次后，可手动完成debug辅助程序运行。
 ## V4（ongo）: 
 1. 可视化页面。
 
